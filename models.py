@@ -49,11 +49,17 @@ class LinkPrediction(nn.Module):
         raise NotImplementedError
 
     def compute_loss(self, ent_embs, rels, neg_idx):
+        """
+        ent_embs torch.Size([512, 2, 128])
+        rels torch.Size([512, 1])
+        neg_idx torch.Size([512, 64, 2])
+        """
         batch_size = ent_embs.shape[0]
 
         # Scores for positive samples
         rels = self.rel_emb(rels)
         heads, tails = torch.chunk(ent_embs, chunks=2, dim=1)
+        # pos heads torch.Size([512, 1, 128])
         pos_scores = self.score_fn(heads, tails, rels)
 
         if self.regularizer > 0:
@@ -64,8 +70,10 @@ class LinkPrediction(nn.Module):
         # Scores for negative samples
         neg_embs = ent_embs.view(batch_size * 2, -1)[neg_idx]
         heads, tails = torch.chunk(neg_embs, chunks=2, dim=2)
+        # neg heads torch.Size([512, 64, 1, 128])
         neg_scores = self.score_fn(heads.squeeze(), tails.squeeze(), rels)
 
+        # pos vs neg size: torch.Size([512, 1]) torch.Size([512, 64])
         model_loss = self.loss_fn(pos_scores, neg_scores)
         return model_loss + reg_loss
 
@@ -116,18 +124,23 @@ class WordEmbeddingsLP(InductiveLinkPrediction):
     specified tensor file.
     """
     def __init__(self, rel_model, loss_fn, num_relations, regularizer,
-                 dim=None, encoder_name=None, embeddings=None):
+                 dim=None, encoder_name=None, embeddings=None, linear=False):
         if not encoder_name and not embeddings:
             raise ValueError('Must provided one of encoder_name or embeddings')
 
         if encoder_name is not None:
             encoder = BertModel.from_pretrained(encoder_name)
             embeddings = encoder.embeddings.word_embeddings
+            embedding_dim = embeddings.embedding_dim
         else:
             emb_tensor = torch.load(embeddings)
             num_embeddings, embedding_dim = emb_tensor.shape
             embeddings = nn.Embedding(num_embeddings, embedding_dim)
             embeddings.weight.data = emb_tensor
+
+        self.linear = linear
+        if self.linear:
+            self.linear_layer = nn.Linear(embedding_dim, embedding_dim)
 
         if dim is None:
             dim = embeddings.embedding_dim
@@ -151,6 +164,8 @@ class BOW(WordEmbeddingsLP):
         lengths = torch.sum(text_mask, dim=-1, keepdim=True)
         embs = torch.sum(text_mask.unsqueeze(dim=-1) * embs, dim=1)
         embs = embs / lengths
+        if self.linear:
+            embs = self.linear_layer(embs)
 
         return embs
 

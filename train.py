@@ -247,7 +247,7 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
 def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                     encoder_name, regularizer, max_len, num_negatives, lr,
                     use_scheduler, batch_size, emb_batch_size, eval_batch_size,
-                    max_epochs, checkpoint, use_cached_text,
+                    max_epochs, checkpoint, use_cached_text, linear,
                     _run: Run, _log: Logger):
     drop_stopwords = model in {'bert-bow', 'bert-dkrl',
                                'glove-bow', 'glove-dkrl'}
@@ -322,7 +322,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
 
     model = utils.get_model(model, dim, rel_model, loss_fn,
                             len(train_val_test_ent), train_data.num_rels,
-                            encoder_name, regularizer)
+                            encoder_name, regularizer, linear)
     if checkpoint is not None:
         model.load_state_dict(torch.load(checkpoint, map_location='cpu'))
 

@@ -1,5 +1,4 @@
---find-links https://download.pytorch.org/whl/torch_stable.html
-torch==1.4.0+cu100
+torch
 scikit-learn
 networkx
 sacred

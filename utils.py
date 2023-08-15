@@ -4,19 +4,20 @@ import models
 
 
 def get_model(model, dim, rel_model, loss_fn, num_entities, num_relations,
-              encoder_name, regularizer):
+              encoder_name, regularizer, linear):
+    # todo Attention: linear only implemented for bow models
     if model == 'blp':
         return models.BertEmbeddingsLP(dim, rel_model, loss_fn, num_relations,
                                        encoder_name, regularizer)
     elif model == 'bert-bow':
         return models.BOW(rel_model, loss_fn, num_relations, regularizer,
-                          encoder_name=encoder_name)
+                          encoder_name=encoder_name, linear=linear)
     elif model == 'bert-dkrl':
         return models.DKRL(dim, rel_model, loss_fn, num_relations, regularizer,
                            encoder_name=encoder_name)
     elif model == 'glove-bow':
         return models.BOW(rel_model, loss_fn, num_relations, regularizer,
-                          embeddings='data/glove/glove.6B.300d.pt')
+                          embeddings='data/glove/glove.6B.300d.pt', linear=linear)
     elif model == 'glove-dkrl':
         return models.DKRL(dim, rel_model, loss_fn, num_relations, regularizer,
                            embeddings='data/glove/glove.6B.300d.pt')
