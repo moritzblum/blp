@@ -1,5 +1,7 @@
+import os
 import os.path as osp
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 import transformers
 import string
@@ -7,6 +9,7 @@ import nltk
 from tqdm import tqdm
 from nltk.corpus import stopwords
 import logging
+from torch_geometric.utils import k_hop_subgraph, subgraph, add_self_loops, to_undirected
 
 UNK = '[UNK]'
 nltk.download('stopwords')
@@ -92,6 +95,7 @@ class GraphDataset(Dataset):
             entities and relations to IDs are saved to disk (for reuse with
             other datasets).
     """
+
     def __init__(self, triples_file, neg_samples=None, write_maps_file=False,
                  num_devices=1):
         directory = osp.dirname(triples_file)
@@ -192,6 +196,7 @@ class TextGraphDataset(GraphDataset):
                  num_devices=1):
         super().__init__(triples_file, neg_samples, write_maps_file,
                          num_devices)
+        self.logger = logging.getLogger()
 
         maps = torch.load(self.maps_path)
         ent_ids = maps['ent_ids']
@@ -199,18 +204,19 @@ class TextGraphDataset(GraphDataset):
         if max_len is None:
             max_len = tokenizer.max_len
 
+        self.max_len = max_len
+
         cached_text_path = osp.join(self.directory, 'text_data.pt')
         need_to_load_text = True
         if use_cached_text:
-            logger = logging.getLogger()
             if osp.exists(cached_text_path):
                 self.text_data = torch.load(cached_text_path)
-                logger.info(f'Loaded cached text data for'
+                self.logger.info(f'Loaded cached text data for'
                             f' {self.text_data.shape[0]} entities,'
                             f' and maximum length {self.text_data.shape[1]}.')
                 need_to_load_text = False
             else:
-                logger.info(f'Cached text data not found.')
+                self.logger.info(f'Cached text data not found.')
 
         if need_to_load_text:
             self.text_data = torch.zeros((len(ent_ids), max_len + 1),
@@ -261,11 +267,20 @@ class TextGraphDataset(GraphDataset):
                                  f' but {len(ent_ids):,} were expected.')
 
             if self.text_data[:, -1].min().item() < 1:
-                raise ValueError(f'Some entries in text_data contain'
-                                 f' length-0 descriptions.')
+                # in the original code this raised an error
+                # changed to print (results still look ok) to reproduce the experiments
+                print(f'Some entries in text_data contain'
+                      f' length-0 descriptions.')
 
             torch.save(self.text_data,
                        osp.join(self.directory, 'text_data.pt'))
+
+        self.logger.info(f'Adding placeholder value for UNK token: {tokenizer.word2idx[UNK]}')
+        placeholder = torch.zeros((1, max_len + 1), dtype=torch.long)
+        placeholder[0][0] = tokenizer.word2idx[UNK]
+        placeholder[0][max_len] = 1  # length 1
+        self.text_data = torch.cat((self.text_data, placeholder), dim=0)
+
 
     def get_entity_description(self, ent_ids):
         """Get entity descriptions for a tensor of entity IDs."""
@@ -298,6 +313,137 @@ class TextGraphDataset(GraphDataset):
                                                 repeats=self.num_devices)
 
         return text_tok, text_mask, rels, neg_idx
+
+
+class NeighborhoodTextGraphDataset(TextGraphDataset):
+    def __init__(self, triples_file, neg_samples, max_len, tokenizer,
+                 drop_stopwords, num_neighbors=5, write_maps_file=False, use_cached_text=False,
+                 num_devices=1, device=None):
+
+        super().__init__(triples_file, neg_samples, max_len, tokenizer,
+                 drop_stopwords, write_maps_file, use_cached_text,
+                 num_devices)
+
+        self.device = device
+        self.num_neighbors = num_neighbors
+
+        maps = torch.load(self.maps_path)
+        blp_ent_ids = maps['ent_ids']  # mapping: entity URI -> ID
+        blp_rel_ids = maps['rel_ids']
+
+        # as this class is just used for the training set, this list only contains train entity
+        train_entities = self.entities
+
+        # just for debugging
+        if not osp.exists(osp.join('./data/Wikidata5M', 'neighbors_tmp.pt')):
+
+            # todo not yet needed to compute every run as we are using only the one hop neighborhood
+            self.load_page_link_graph_inductive(osp.join('./data/Wikidata5M', 'page_links_typed.pt'),
+                                               osp.join('./data/Wikidata5M', 'inductive_page_links_typed.pt') ,
+                                               set(train_entities))
+
+            self.page_link_graph_edge_index = torch.stack([self.page_link_graph[:, 0], self.page_link_graph[:, 2]]).to(self.device)
+            self.page_link_graph_edge_type = self.page_link_graph[:, 1].to(self.device)
+
+            pre_computed_neighborhood_file = osp.join('./data/Wikidata5M', 'pre_computed_neighborhood.pt')
+            if not osp.exists(pre_computed_neighborhood_file):
+                print('Pre-computing neighborhood.')
+                neighbors = {}
+                for id in tqdm(blp_ent_ids.values()):
+                    _, edge_index_sample, _, _ = k_hop_subgraph(id, 1,
+                                                                self.page_link_graph_edge_index,
+                                                                relabel_nodes=False, flow="target_to_source",
+                                                                directed=True)
+                    neighbors[id] = torch.unique(edge_index_sample).cpu()
+                torch.save(neighbors, pre_computed_neighborhood_file)
+            else:
+                print('Loading pre-computed neighborhood.')
+                neighbors = torch.load(pre_computed_neighborhood_file)
+
+            self.neighbors = torch.full((max(blp_ent_ids.values()) + 1, self.num_neighbors), -1)
+            print('Filling neighbors tensor.')
+            for ent_id, neigh_ids in tqdm(neighbors.items()):
+                self.neighbors[ent_id, :min(neigh_ids.shape[0], self.num_neighbors)] = neigh_ids[:self.num_neighbors]
+
+            torch.save(self.neighbors, osp.join('./data/Wikidata5M', 'neighbors_tmp.pt'))
+        else:
+            print('Attention: Loading pre-computed neighborhood for debugging.')
+            self.neighbors = torch.load(osp.join('./data/Wikidata5M', 'neighbors_tmp.pt'))
+
+
+    def collate_fn(self, data_list):
+        """Given a batch of triples, return it in the form of
+        entity descriptions, and the relation types between them.
+        Use as a collate_fn for a DataLoader.
+        """
+        batch_size = len(data_list) // self.num_devices
+        if batch_size <= 1:
+            raise ValueError('collate_text can only work with batch sizes'
+                             ' larger than 1.')
+
+        pos_pairs, rels = torch.stack(data_list).split(2, dim=1)
+        text_tok, text_mask, text_len = self.get_entity_description(pos_pairs)
+
+        neighbors_head = self.neighbors[pos_pairs[:, 0]]
+        neighbors_tail = self.neighbors[pos_pairs[:, 1]]
+
+        text_tok_neighborhood_head, text_mask_neighborhood_head, _ = self.get_entity_description(neighbors_head)
+        text_tok_neighborhood_tail, text_mask_neighborhood_tail, _ = self.get_entity_description(neighbors_tail)
+
+        neg_idx = get_negative_sampling_indices(batch_size, self.neg_samples,
+                                                repeats=self.num_devices)
+
+        return text_tok, text_mask, rels, neg_idx, text_tok_neighborhood_head, text_mask_neighborhood_head, text_tok_neighborhood_tail, text_mask_neighborhood_tail
+
+
+    def load_page_link_graph_inductive(self, raw_file_path, processed_file_path, train_entities):
+        if os.path.isfile(processed_file_path):
+            print('Loading inductive page link graph.')
+            self.page_link_graph = torch.load(processed_file_path)
+        else:
+            maps = torch.load(self.maps_path)
+            blp_ent_ids = maps['ent_ids']
+            blp_rel_ids = maps['rel_ids']
+
+            page_links_graph_raw = []
+            skipped = 0
+            with open(raw_file_path) as page_linkes_raw_in:
+                for line in page_linkes_raw_in:
+                    head, relation, tail = line.strip().split('\t')
+                    if head not in blp_ent_ids or tail not in blp_ent_ids:
+                        skipped += 1
+                        continue
+
+                    page_links_graph_raw.append([blp_ent_ids[head], blp_rel_ids[relation], blp_ent_ids[tail]])
+            print('Skipped', skipped, 'triples because of missing entities.')
+
+            page_links_graph_raw = torch.tensor(page_links_graph_raw, dtype=torch.long)
+
+            mask_allowed_triples = []
+            for i in tqdm(range(page_links_graph_raw.size(0))):
+                head, relation, tail = page_links_graph_raw[i][0].item(), page_links_graph_raw[i][
+                    1].item(), \
+                                       page_links_graph_raw[i][2].item()
+                # if an entity has a page link to a test entity, this link is removed if the entity itself is in
+                # the training set. If the entity is also a test entity, there is no issue.
+                if tail in train_entities:
+                    mask_allowed_triples.append(True)
+                else:
+                    if head in train_entities:
+                        mask_allowed_triples.append(False)
+                    else:
+                        mask_allowed_triples.append(True)
+
+            print('Ratio of triples maintained:',
+                  sum([1 for x in mask_allowed_triples if x]) / page_links_graph_raw.size(0))
+
+            mask_allowed_triples = torch.tensor(mask_allowed_triples)
+            page_links_graph_inductive = page_links_graph_raw[mask_allowed_triples]
+            print('Page link graph filtered for the inductive setting.')
+            torch.save(page_links_graph_inductive, processed_file_path)
+            self.page_link_graph = page_links_graph_inductive
+
+        self.page_link_graph = self.page_link_graph.type(torch.int64)
 
 
 class GloVeTokenizer:

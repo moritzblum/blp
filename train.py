@@ -15,10 +15,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 import joblib
 
-from data import CATEGORY_IDS
+from data import CATEGORY_IDS, NeighborhoodTextGraphDataset
 from data import GraphDataset, TextGraphDataset, GloVeTokenizer
 import models
 import utils
+import wandb
 
 OUT_PATH = 'output/'
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -52,6 +53,10 @@ def config():
     max_epochs = 40
     checkpoint = None
     use_cached_text = False
+    linear = False
+    neighborhood_enrichment = False
+    neighborhood_pooling = False
+    num_neighbors = 5
 
 
 @ex.capture
@@ -102,12 +107,46 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
         # Get a batch of entity IDs and encode them
         batch_ents = entities[idx:idx + emb_batch_size]
 
+        # add padding to even size for allowing reshaping and splitting of the neighbors
+        padding = batch_ents.size(0) % 2 == 1
+        print('padding batch for neighborhood splitting:', padding)
+
+        if padding:
+            batch_ents = torch.cat((batch_ents, batch_ents[-1].unsqueeze(0)))
+
         if isinstance(model, models.InductiveLinkPrediction):
             # Encode with entity descriptions
-            data = text_dataset.get_entity_description(batch_ents)
-            text_tok, text_mask, text_len = data
-            batch_emb = model(text_tok.unsqueeze(1).to(device),
-                              text_mask.unsqueeze(1).to(device))
+
+            #print('batch_ents size', batch_ents.size())
+            text_tok, text_mask, text_len = text_dataset.get_entity_description(batch_ents)
+            #print('text_tok size', text_tok.size())
+
+
+            neighbors = text_dataset.neighbors[batch_ents].view(-1, 2)
+
+
+            # neighbors are split into two columns, one for head and one for tail in order to use the
+            # existing forward function
+            text_tok_neighbors_head, text_mask_neighbors_head, _ = text_dataset.get_entity_description(neighbors[:,0])
+            #print('eval neighbors size:', text_tok_neighbors_head.size())
+            text_tok_neighbors_tail, text_mask_neighbors_tail, _ = text_dataset.get_entity_description(neighbors[:,1])
+
+            #print('text_tok size', text_tok.size())
+            #print('text_tok.unsqueeze(1) size', text_tok.unsqueeze(1).size())
+
+            batch_emb = model(text_tok=text_tok.unsqueeze(1).to(device),
+                              text_mask=text_mask.unsqueeze(1).to(device),
+                              text_tok_neighborhood_head=text_tok_neighbors_head.to(device),
+                              text_mask_neighborhood_head=text_mask_neighbors_head.to(device),
+                              text_tok_neighborhood_tail=text_tok_neighbors_tail.to(device),
+                              text_mask_neighborhood_tail=text_mask_neighbors_tail.to(device))
+
+            # remove embedded padding
+            if padding:
+                batch_emb = batch_emb[:-1]
+
+            #print('----')
+
         else:
             # Encode from lookup table
             batch_emb = model(batch_ents)
@@ -247,8 +286,18 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
 def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                     encoder_name, regularizer, max_len, num_negatives, lr,
                     use_scheduler, batch_size, emb_batch_size, eval_batch_size,
-                    max_epochs, checkpoint, use_cached_text, linear,
+                    max_epochs, checkpoint, use_cached_text, linear, neighborhood_enrichment, neighborhood_pooling, num_neighbors,
                     _run: Run, _log: Logger):
+
+    _log.info(f'config: {_run.config}')
+
+    wandb.login()
+    wandb.init(
+        # Set the project where this run will be logged
+        project="blp",
+        # Track hyperparameters and run metadata
+        config=_run.config)
+
     drop_stopwords = model in {'bert-bow', 'bert-dkrl',
                                'glove-bow', 'glove-dkrl'}
 
@@ -275,11 +324,21 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
         else:
             tokenizer = GloVeTokenizer('data/glove/glove.6B.300d-maps.pt')
 
-        train_data = TextGraphDataset(triples_file, num_negatives,
-                                      max_len, tokenizer, drop_stopwords,
-                                      write_maps_file=True,
-                                      use_cached_text=use_cached_text,
-                                      num_devices=num_devices)
+        if neighborhood_enrichment:
+            print('neighborhood_enrichment:', neighborhood_enrichment)
+            train_data = NeighborhoodTextGraphDataset(triples_file, num_negatives,
+                                          max_len, tokenizer, drop_stopwords,
+                                          num_neighbors=num_neighbors,
+                                          write_maps_file=True,
+                                          use_cached_text=use_cached_text,
+                                          num_devices=num_devices,
+                                          device=device)
+        else:
+            train_data = TextGraphDataset(triples_file, num_negatives,
+                                          max_len, tokenizer, drop_stopwords,
+                                          write_maps_file=True,
+                                          use_cached_text=use_cached_text,
+                                          num_devices=num_devices)
 
     train_loader = DataLoader(train_data, batch_size, shuffle=True,
                               collate_fn=train_data.collate_fn,
@@ -306,6 +365,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
         train_val_test_ent = set(test_data.entities.tolist()).union(train_val_ent)
         val_new_ents = train_val_ent.difference(train_ent)
         test_new_ents = train_val_test_ent.difference(train_val_ent)
+
     else:
         graph = None
 
@@ -322,7 +382,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
 
     model = utils.get_model(model, dim, rel_model, loss_fn,
                             len(train_val_test_ent), train_data.num_rels,
-                            encoder_name, regularizer, linear)
+                            encoder_name, regularizer, linear, neighborhood_pooling)
     if checkpoint is not None:
         model.load_state_dict(torch.load(checkpoint, map_location='cpu'))
 
@@ -340,6 +400,22 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
     checkpoint_file = osp.join(OUT_PATH, f'model-{_run._id}.pt')
     for epoch in range(1, max_epochs + 1):
         train_loss = 0
+
+        # --- start: added for debugging
+        #_log.info('Evaluating on validation set')
+        #val_mrr, _ = eval_link_prediction(model, valid_loader, train_data,
+        #                                  train_val_ent, epoch,
+        #                                  emb_batch_size, prefix='valid')
+
+        #_log.info('Evaluating on test set')
+        #_, ent_emb = eval_link_prediction(model, test_loader, train_data,
+        #                                  train_val_test_ent, max_epochs + 1,
+        #                                  emb_batch_size, prefix='test',
+        #                                  filtering_graph=graph,
+        #                                  new_entities=test_new_ents,
+        #                                  return_embeddings=True)
+        # --- end: added for debugging
+
         for step, data in enumerate(train_loader):
             loss = model(*data).mean()
 
@@ -368,6 +444,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
         val_mrr, _ = eval_link_prediction(model, valid_loader, train_data,
                                           train_val_ent, epoch,
                                           emb_batch_size, prefix='valid')
+        wandb.log({"val_mrr": val_mrr, "loss": train_loss / len(train_loader)})
 
         # Keep checkpoint of best performing model (based on raw MRR)
         if val_mrr > best_valid_mrr:
@@ -479,6 +556,7 @@ def node_classification(dataset, checkpoint, _run: Run, _log: Logger):
     joblib.dump({'model': model,
                  'id_to_class': id_to_class},
                 osp.join('output', f'classifier-{checkpoint}.joblib'))
+
 
 
 ex.run_commandline()

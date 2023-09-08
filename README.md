@@ -390,3 +390,9 @@ python train.py with dataset='my-kg'
 ## Alternative implementations
 
 - [Contextual Knowledge Bases](https://github.com/raphaelsty/ckb) by Raphael Sourty
+
+
+## Graph Context Experiments on Wikidata5m Ind.
+
+* glove-bow (TransE): `test mrr: 0.3329  hits@1: 0.0793  hits@3: 0.5116  hits@10: 0.7680  mrr_filt: 0.3421  hits@1_filt: 0.0837  hits@3_filt: 0.5307  hits@10_filt: 0.7715`
+
