@@ -3,22 +3,22 @@ import logging
 import models
 
 
-def get_model(model, dim, rel_model, loss_fn, num_entities, num_relations,
-              encoder_name, regularizer, linear, neighborhood_pooling):
+def get_model(model, dim, rel_model, loss_fn, num_entities, num_relations, encoder_name, regularizer,
+              neighborhood_pooling, fusion_linear, fusion_gate, num_neighbors):
     # todo Attention: linear only implemented for bow models
     if model == 'blp':
         return models.BertEmbeddingsLP(dim, rel_model, loss_fn, num_relations,
                                        encoder_name, regularizer)
     elif model == 'bert-bow':
         return models.BOW(rel_model, loss_fn, num_relations, regularizer,
-                          encoder_name=encoder_name, linear=linear, neighborhood_pooling=neighborhood_pooling)
+                          encoder_name=encoder_name, neighborhood_pooling=neighborhood_pooling, linear=fusion_linear, fusion_gate=fusion_gate)
     elif model == 'bert-dkrl':
         return models.DKRL(dim, rel_model, loss_fn, num_relations, regularizer,
                            encoder_name=encoder_name)
     elif model == 'glove-bow':
         print('utils:', neighborhood_pooling)
         return models.BOW(rel_model, loss_fn, num_relations, regularizer,
-                          embeddings='data/glove/glove.6B.300d.pt', linear=linear, neighborhood_pooling=neighborhood_pooling)
+                          embeddings='data/glove/glove.6B.300d.pt', neighborhood_pooling=neighborhood_pooling, linear=fusion_linear, fusion_gate=fusion_gate, num_neighbors=num_neighbors)
     elif model == 'glove-dkrl':
         return models.DKRL(dim, rel_model, loss_fn, num_relations, regularizer,
                            embeddings='data/glove/glove.6B.300d.pt')

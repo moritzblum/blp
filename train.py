@@ -15,8 +15,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 import joblib
 
-from data import CATEGORY_IDS, NeighborhoodTextGraphDataset
-from data import GraphDataset, TextGraphDataset, GloVeTokenizer
+from data import CATEGORY_IDS, RANDOM
+from data import GraphDataset, TextGraphDataset, GloVeTokenizer, NeighborhoodTextGraphDataset
 import models
 import utils
 import wandb
@@ -53,10 +53,19 @@ def config():
     max_epochs = 40
     checkpoint = None
     use_cached_text = False
-    linear = False
+    use_cached_neighbors = False
     neighborhood_enrichment = False
+    # if neighborhood_enrichment is true, one enrichment strategy has to be set
     neighborhood_pooling = False
+    # if additional features are created for neighbors, set at least one of the following fusion
+    # parameters
+    fusion_linear = False  # can also be used if no fusion is applied
+    fusion_gate = False
+    # neighborhood selection strategy
     num_neighbors = 5
+    neighborhood_selection = RANDOM
+    # logging
+    wandb_logging = False
 
 
 @ex.capture
@@ -286,17 +295,20 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
 def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                     encoder_name, regularizer, max_len, num_negatives, lr,
                     use_scheduler, batch_size, emb_batch_size, eval_batch_size,
-                    max_epochs, checkpoint, use_cached_text, linear, neighborhood_enrichment, neighborhood_pooling, num_neighbors,
+                    max_epochs, checkpoint, use_cached_text, use_cached_neighbors,
+                    neighborhood_enrichment, neighborhood_pooling, fusion_linear,
+                    fusion_gate, num_neighbors, neighborhood_selection, wandb_logging,
                     _run: Run, _log: Logger):
 
     _log.info(f'config: {_run.config}')
 
-    wandb.login()
-    wandb.init(
-        # Set the project where this run will be logged
-        project="blp",
-        # Track hyperparameters and run metadata
-        config=_run.config)
+    if wandb_logging:
+        wandb.login()
+        wandb.init(
+            # Set the project where this run will be logged
+            project="blp",
+            # Track hyperparameters and run metadata
+            config=_run.config)
 
     drop_stopwords = model in {'bert-bow', 'bert-dkrl',
                                'glove-bow', 'glove-dkrl'}
@@ -329,8 +341,10 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
             train_data = NeighborhoodTextGraphDataset(triples_file, num_negatives,
                                           max_len, tokenizer, drop_stopwords,
                                           num_neighbors=num_neighbors,
+                                          selection=neighborhood_selection,
                                           write_maps_file=True,
                                           use_cached_text=use_cached_text,
+                                          use_cached_neighbors=use_cached_neighbors,
                                           num_devices=num_devices,
                                           device=device)
         else:
@@ -382,7 +396,8 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
 
     model = utils.get_model(model, dim, rel_model, loss_fn,
                             len(train_val_test_ent), train_data.num_rels,
-                            encoder_name, regularizer, linear, neighborhood_pooling)
+                            encoder_name, regularizer, neighborhood_pooling, fusion_linear, fusion_gate,
+                            num_neighbors)
     if checkpoint is not None:
         model.load_state_dict(torch.load(checkpoint, map_location='cpu'))
 
@@ -444,7 +459,8 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
         val_mrr, _ = eval_link_prediction(model, valid_loader, train_data,
                                           train_val_ent, epoch,
                                           emb_batch_size, prefix='valid')
-        wandb.log({"val_mrr": val_mrr, "loss": train_loss / len(train_loader)})
+        if wandb_logging:
+            wandb.log({"val_mrr": val_mrr, "loss": train_loss / len(train_loader)})
 
         # Keep checkpoint of best performing model (based on raw MRR)
         if val_mrr > best_valid_mrr:

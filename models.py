@@ -4,18 +4,49 @@ import torch.nn.functional as F
 from transformers import BertModel
 
 
+class Gate(nn.Module):
+
+    def __init__(self,
+                 input_size,
+                 output_size,
+                 gate_activation=nn.functional.sigmoid):
+
+        super(Gate, self).__init__()
+        self.output_size = output_size
+
+        self.gate_activation = gate_activation
+        self.g = nn.Linear(input_size, output_size)
+        self.g1 = nn.Linear(output_size, output_size, bias=False)
+        self.g2 = nn.Linear(input_size-output_size, output_size, bias=False)
+        self.gate_bias = nn.Parameter(torch.zeros(output_size))
+
+    def forward(self, x_ent, x_lit):
+        #print_tensor_stats('gate x_ent', x_ent)
+        #print_tensor_stats('gate x_lit', x_lit)
+        x = torch.cat([x_ent, x_lit], 1)
+        g_embedded = F.tanh(self.g(x))
+        gate = self.gate_activation(self.g1(x_ent) + self.g2(x_lit) + self.gate_bias)
+        output = (1-gate) * x_ent + gate * g_embedded
+
+        return output
+
+
 class LinkPrediction(nn.Module):
     """A general link prediction model with a lookup table for relation
     embeddings."""
 
-    def __init__(self, dim, rel_model, loss_fn, num_relations, regularizer, linear=False, neighborhood_pooling=False):
+    def __init__(self, dim, rel_model, loss_fn, num_relations, regularizer, neighborhood_pooling=False,
+                 linear=False, fusion_gate=False, num_neighbors=5):
         super().__init__()
         print('LinkPrediction', neighborhood_pooling)
         self.dim = dim
         self.normalize_embs = False
         self.regularizer = regularizer
         self.linear = linear
+        self.fusion_gate= fusion_gate
+        self.gate = True  # todo make hyperparameter
         self.neighborhood_pooling = neighborhood_pooling
+        self.num_neighbors = num_neighbors
 
         if rel_model == 'transe':
             self.score_fn = transe_score
@@ -29,17 +60,20 @@ class LinkPrediction(nn.Module):
         else:
             raise ValueError(f'Unknown relational model {rel_model}.')
 
-        self.fusion_dim = self.dim * 2 if self.neighborhood_pooling else self.dim
-
         self.rel_emb = nn.Embedding(num_relations, self.dim)
         nn.init.xavier_uniform_(self.rel_emb.weight.data)
 
-        # is also used for fusion of entity representation with pooled neighborhood representation
-        if self.linear:
-            self.linear_layer = nn.Linear(self.fusion_dim, self.dim)
+        if self.fusion_gate:
+            self.gate = Gate(self.dim * 2, self.dim)
 
-        # todo replace magic number 5 by num_neighbors
-        self.num_neighbors = 5
+        if self.linear:
+            if self.neighborhood_pooling and not self.fusion_gate:
+                # linear layer is used for fusion
+                self.linear_layer = nn.Linear(self.dim * 2, self.dim)
+            else:
+                self.linear_layer = nn.Linear(self.dim, self.dim)
+
+
         self.neighborhood_pooling = torch.nn.AvgPool2d((self.num_neighbors, 1), stride=1)
 
         if loss_fn == 'margin':
@@ -47,8 +81,7 @@ class LinkPrediction(nn.Module):
         elif loss_fn == 'nll':
             self.loss_fn = nll_loss
         else:
-            raise ValueError(f'Unkown loss function {loss_fn}')
-
+            raise ValueError(f'Unknown loss function {loss_fn}')
 
     def encode(self, *args, **kwargs):
         ent_emb = self._encode_entity(*args, **kwargs)
@@ -94,8 +127,9 @@ class LinkPrediction(nn.Module):
 
 
 def print_tensor_stats(name, tensor):
-    #print(f'{name} size: {tensor.size()}, nan: {torch.isnan(tensor).any()}, inf: {torch.isinf(tensor).any()}', tensor)
+    # print(f'{name} size: {tensor.size()}, nan: {torch.isnan(tensor).any()}, inf: {torch.isinf(tensor).any()}', tensor)
     pass
+
 
 class InductiveLinkPrediction(LinkPrediction):
     """Description-based Link Prediction (DLP)."""
@@ -122,14 +156,13 @@ class InductiveLinkPrediction(LinkPrediction):
         ent_embs = self.encode(text_tok.view(-1, num_text_tokens),
                                text_mask.view(-1, num_text_tokens))
 
-
-        #print('ent_embs before fusion', ent_embs.size())
+        # print('ent_embs before fusion', ent_embs.size())
 
         if text_tok_neighborhood_head is not None:
             print_tensor_stats('model txt tok regular', text_tok)
             print_tensor_stats('model txt emb regular', ent_embs)
-            #print('txt tok regular:', text_tok.size(), torch.isnan(text_tok).any(), text_tok)
-            #print('txt emb regular:', ent_embs.size(), torch.isnan(ent_embs).any(), ent_embs)
+            # print('txt tok regular:', text_tok.size(), torch.isnan(text_tok).any(), text_tok)
+            # print('txt emb regular:', ent_embs.size(), torch.isnan(ent_embs).any(), ent_embs)
 
             print_tensor_stats('model text_tok_neighborhood_head', text_tok_neighborhood_head)
             print_tensor_stats('model text_tok_neighborhood_tail', text_tok_neighborhood_tail)
@@ -137,40 +170,51 @@ class InductiveLinkPrediction(LinkPrediction):
                                               text_mask_neighborhood_head.view(-1, num_text_tokens))
 
             neigh_ent_embs_tail = self.encode(text_tok_neighborhood_tail.view(-1, num_text_tokens),
-                                                text_mask_neighborhood_tail.view(-1, num_text_tokens))
+                                              text_mask_neighborhood_tail.view(-1, num_text_tokens))
 
             print_tensor_stats('model neigh_ent_embs_head', neigh_ent_embs_head)
 
-            neigh_ent_embs_head_reshaped = neigh_ent_embs_head.reshape((-1, self.num_neighbors, self.dim))
-            neigh_ent_embs_tail_reshaped = neigh_ent_embs_tail.reshape((-1, self.num_neighbors, self.dim))
+            neigh_ent_embs_head_reshaped = neigh_ent_embs_head.reshape(
+                (-1, self.num_neighbors, self.dim))
+            neigh_ent_embs_tail_reshaped = neigh_ent_embs_tail.reshape(
+                (-1, self.num_neighbors, self.dim))
 
             # todo make pooling function a hyperparameter
-            neigh_ent_embs_head_avg_pool = self.neighborhood_pooling(neigh_ent_embs_head_reshaped).view(-1, self.dim)
-            neigh_ent_embs_tail_avg_pool = self.neighborhood_pooling(neigh_ent_embs_tail_reshaped).view(-1, self.dim)
+            neigh_ent_embs_head_avg_pool = self.neighborhood_pooling(neigh_ent_embs_head_reshaped).view(
+                -1, self.dim)
+            neigh_ent_embs_tail_avg_pool = self.neighborhood_pooling(neigh_ent_embs_tail_reshaped).view(
+                -1, self.dim)
             print_tensor_stats('txt emb head pooled', neigh_ent_embs_head_avg_pool)
 
-            neigh_ent_embs_pooled = torch.stack((neigh_ent_embs_head_avg_pool, neigh_ent_embs_tail_avg_pool), dim=1).view(-1, self.dim)
+            neigh_ent_embs_pooled = torch.stack(
+                (neigh_ent_embs_head_avg_pool, neigh_ent_embs_tail_avg_pool), dim=1).view(-1, self.dim)
             print_tensor_stats('txt emb head & tail stacked and reshaped', neigh_ent_embs_pooled)
-            #print('txt emb head & tail stacked and reshaped', neigh_ent_embs_pooled.size(), neigh_ent_embs_pooled)
+            # print('txt emb head & tail stacked and reshaped', neigh_ent_embs_pooled.size(), neigh_ent_embs_pooled)
 
-            # todo how does it happen that with two devices, the data for one model happen to be on different devices?
-            # todo maybe both have to be moved manually to the same device?
-            ent_embs = torch.cat((ent_embs, neigh_ent_embs_pooled), dim=1)
-            #print('txt emb fused', ent_embs.size(), ent_embs)
+            # todo new
+            print_tensor_stats('ent_embs', ent_embs)
+            print_tensor_stats('neigh_ent_embs_pooled', neigh_ent_embs_pooled)
+            ent_embs = self.gate(ent_embs, neigh_ent_embs_pooled)
+
+            # todo commented for debugging new gate function
+            #ent_embs = torch.cat((ent_embs, neigh_ent_embs_pooled), dim=1)
+
+            # print('txt emb fused', ent_embs.size(), ent_embs)
             print_tensor_stats('txt emb fused', ent_embs)
 
-            #print('---')
+            # print('---')
 
-        #print('ent_embs after fusion', ent_embs.size())
+        # print('ent_embs after fusion', ent_embs.size())
 
+        # todo commented for debugging new gate function
         if self.linear:
             ent_embs = self.linear_layer(ent_embs)
 
-        #print('ent_embs after linear', ent_embs.size())
+        # print('ent_embs after linear', ent_embs.size())
 
         if rels is None and neg_idx is None:
             # Forward is being used to compute entity embeddings only
-            print('Forward is being used to compute entity embeddings only')
+            #print('Forward is being used to compute entity embeddings only')
             out = ent_embs
         else:
             # Forward is being used to compute link prediction loss
@@ -205,7 +249,8 @@ class WordEmbeddingsLP(InductiveLinkPrediction):
     """
 
     def __init__(self, rel_model, loss_fn, num_relations, regularizer,
-                 dim=None, encoder_name=None, embeddings=None, linear=False, neighborhood_pooling=False):
+                 dim=None, encoder_name=None, embeddings=None, neighborhood_pooling=False, linear=False,
+                 fusion_gate=False, num_neighbors=5):
         print('WordEmbeddingsLP', neighborhood_pooling)
         if not encoder_name and not embeddings:
             raise ValueError('Must provided one of encoder_name or embeddings')
@@ -223,11 +268,10 @@ class WordEmbeddingsLP(InductiveLinkPrediction):
         if dim is None:
             dim = embeddings.embedding_dim
 
-        super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, linear, neighborhood_pooling)
+        super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, linear, fusion_gate,
+                         neighborhood_pooling, num_neighbors)
 
         self.embeddings = embeddings
-
-
 
     def _encode_entity(self, text_tok, text_mask):
         raise NotImplementedError

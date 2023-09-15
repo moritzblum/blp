@@ -1,5 +1,7 @@
 import os
 import os.path as osp
+from collections import Counter
+
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
@@ -17,6 +19,12 @@ nltk.download('punkt')
 STOP_WORDS = stopwords.words('english')
 DROPPED = STOP_WORDS + list(string.punctuation)
 CATEGORY_IDS = {'1-to-1': 0, '1-to-many': 1, 'many-to-1': 2, 'many-to-many': 3}
+
+DEGREE_TRAIN = 'degree_train'
+RANDOM = 'random'
+TFIDF_RELEVANCE = 'tfidf_relevance'
+SEMANTIC_RELEVANCE = 'semantic_relevance'
+SEMANTIC_RELEVANCE_REDUNDANCY = 'semantic_relevance_redundancy'
 
 
 def file_to_ids(file_path):
@@ -212,8 +220,8 @@ class TextGraphDataset(GraphDataset):
             if osp.exists(cached_text_path):
                 self.text_data = torch.load(cached_text_path)
                 self.logger.info(f'Loaded cached text data for'
-                            f' {self.text_data.shape[0]} entities,'
-                            f' and maximum length {self.text_data.shape[1]}.')
+                                 f' {self.text_data.shape[0]} entities,'
+                                 f' and maximum length {self.text_data.shape[1]}.')
                 need_to_load_text = False
             else:
                 self.logger.info(f'Cached text data not found.')
@@ -281,7 +289,6 @@ class TextGraphDataset(GraphDataset):
         placeholder[0][max_len] = 1  # length 1
         self.text_data = torch.cat((self.text_data, placeholder), dim=0)
 
-
     def get_entity_description(self, ent_ids):
         """Get entity descriptions for a tensor of entity IDs."""
         text_data = self.text_data[ent_ids]
@@ -317,15 +324,17 @@ class TextGraphDataset(GraphDataset):
 
 class NeighborhoodTextGraphDataset(TextGraphDataset):
     def __init__(self, triples_file, neg_samples, max_len, tokenizer,
-                 drop_stopwords, num_neighbors=5, write_maps_file=False, use_cached_text=False,
+                 drop_stopwords, num_neighbors=5, selection=RANDOM, write_maps_file=False,
+                 use_cached_text=False, use_cached_neighbors=False,
                  num_devices=1, device=None):
 
         super().__init__(triples_file, neg_samples, max_len, tokenizer,
-                 drop_stopwords, write_maps_file, use_cached_text,
-                 num_devices)
+                         drop_stopwords, write_maps_file, use_cached_text,
+                         num_devices)
 
         self.device = device
         self.num_neighbors = num_neighbors
+        self.selection = selection
 
         maps = torch.load(self.maps_path)
         blp_ent_ids = maps['ent_ids']  # mapping: entity URI -> ID
@@ -335,40 +344,57 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         train_entities = self.entities
 
         # just for debugging
-        if not osp.exists(osp.join('./data/Wikidata5M', 'neighbors_tmp.pt')):
+        if not use_cached_neighbors:
 
             # todo not yet needed to compute every run as we are using only the one hop neighborhood
-            self.load_page_link_graph_inductive(osp.join('./data/Wikidata5M', 'page_links_typed.pt'),
-                                               osp.join('./data/Wikidata5M', 'inductive_page_links_typed.pt') ,
-                                               set(train_entities))
+            #self.load_page_link_graph_inductive(osp.join('./data/Wikidata5M', 'page_links_typed.pt'),
+            #                                    osp.join('./data/Wikidata5M',
+            #                                             'inductive_page_links_typed.pt'),
+            #                                    set(train_entities))
 
-            self.page_link_graph_edge_index = torch.stack([self.page_link_graph[:, 0], self.page_link_graph[:, 2]]).to(self.device)
-            self.page_link_graph_edge_type = self.page_link_graph[:, 1].to(self.device)
+            #self.page_link_graph_edge_index = torch.stack(
+            #    [self.page_link_graph[:, 0], self.page_link_graph[:, 2]]).to(self.device)
+            #self.page_link_graph_edge_type = self.page_link_graph[:, 1].to(self.device)
+            # -> end block
 
-            pre_computed_neighborhood_file = osp.join('./data/Wikidata5M', 'pre_computed_neighborhood.pt')
-            if not osp.exists(pre_computed_neighborhood_file):
-                print('Pre-computing neighborhood.')
-                neighbors = {}
+            pre_computed_direct_neighborhood_file = osp.join('./data/Wikidata5M',
+                                                      'pre_computed_direct_neighborhood.pt')
+            if not osp.exists(pre_computed_direct_neighborhood_file):
+                self.logger.info('Pre-computing neighborhood.')
+                neighbor_dict = {}
                 for id in tqdm(blp_ent_ids.values()):
                     _, edge_index_sample, _, _ = k_hop_subgraph(id, 1,
                                                                 self.page_link_graph_edge_index,
-                                                                relabel_nodes=False, flow="target_to_source",
+                                                                relabel_nodes=False,
+                                                                flow="target_to_source",
                                                                 directed=True)
-                    neighbors[id] = torch.unique(edge_index_sample).cpu()
-                torch.save(neighbors, pre_computed_neighborhood_file)
+                    neighbor_dict[id] = torch.unique(edge_index_sample).cpu()
+                torch.save(neighbor_dict, pre_computed_direct_neighborhood_file)
             else:
-                print('Loading pre-computed neighborhood.')
-                neighbors = torch.load(pre_computed_neighborhood_file)
+                self.logger.info('Loading pre-computed neighborhood.')
+                neighbor_dict = torch.load(pre_computed_direct_neighborhood_file)
 
-            self.neighbors = torch.full((max(blp_ent_ids.values()) + 1, self.num_neighbors), -1)
-            print('Filling neighbors tensor.')
-            for ent_id, neigh_ids in tqdm(neighbors.items()):
-                self.neighbors[ent_id, :min(neigh_ids.shape[0], self.num_neighbors)] = neigh_ids[:self.num_neighbors]
+            max_relevant_neighbors = 20
+            neighbor_tensor = torch.full((max(blp_ent_ids.values()) + 1, max_relevant_neighbors), -1)
 
-            torch.save(self.neighbors, osp.join('./data/Wikidata5M', 'neighbors_tmp.pt'))
+            degree_dict = Counter(self.triples[:, 0].tolist() + self.triples[:, 1].tolist())
+
+            for ent_id, neigh_ids in tqdm(neighbor_dict.items()):
+                if self.selection == DEGREE_TRAIN:
+                    neighbors_list_ordered = torch.tensor(sorted(neigh_ids.tolist(),
+                                                    key=lambda e: - degree_dict[e]))
+                else:
+                    neighbors_list_ordered = neighbor_dict[ent_id]
+
+                neighbor_tensor[ent_id, :min(neighbors_list_ordered.shape[0], max_relevant_neighbors)] = neighbors_list_ordered[
+                                                                                            :max_relevant_neighbors]
+
+            torch.save(neighbor_tensor, osp.join('./data/Wikidata5M', 'neighbors_tmp.pt'))
         else:
-            print('Attention: Loading pre-computed neighborhood for debugging.')
-            self.neighbors = torch.load(osp.join('./data/Wikidata5M', 'neighbors_tmp.pt'))
+            self.logger.info('Attention: Loading pre-computed neighborhood for debugging.')
+            neighbor_tensor = torch.load(osp.join('./data/Wikidata5M', 'neighbors_tmp.pt'))
+
+        self.neighbors = neighbor_tensor[:, :self.num_neighbors]
 
 
     def collate_fn(self, data_list):
@@ -387,14 +413,15 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         neighbors_head = self.neighbors[pos_pairs[:, 0]]
         neighbors_tail = self.neighbors[pos_pairs[:, 1]]
 
-        text_tok_neighborhood_head, text_mask_neighborhood_head, _ = self.get_entity_description(neighbors_head)
-        text_tok_neighborhood_tail, text_mask_neighborhood_tail, _ = self.get_entity_description(neighbors_tail)
+        text_tok_neighborhood_head, text_mask_neighborhood_head, _ = self.get_entity_description(
+            neighbors_head)
+        text_tok_neighborhood_tail, text_mask_neighborhood_tail, _ = self.get_entity_description(
+            neighbors_tail)
 
         neg_idx = get_negative_sampling_indices(batch_size, self.neg_samples,
                                                 repeats=self.num_devices)
 
         return text_tok, text_mask, rels, neg_idx, text_tok_neighborhood_head, text_mask_neighborhood_head, text_tok_neighborhood_tail, text_mask_neighborhood_tail
-
 
     def load_page_link_graph_inductive(self, raw_file_path, processed_file_path, train_entities):
         if os.path.isfile(processed_file_path):
@@ -414,7 +441,8 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
                         skipped += 1
                         continue
 
-                    page_links_graph_raw.append([blp_ent_ids[head], blp_rel_ids[relation], blp_ent_ids[tail]])
+                    page_links_graph_raw.append(
+                        [blp_ent_ids[head], blp_rel_ids[relation], blp_ent_ids[tail]])
             print('Skipped', skipped, 'triples because of missing entities.')
 
             page_links_graph_raw = torch.tensor(page_links_graph_raw, dtype=torch.long)
