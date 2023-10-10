@@ -1,5 +1,7 @@
 import os
 import os.path as osp
+from datetime import datetime
+
 import networkx as nx
 import torch
 from torch.optim import Adam
@@ -66,6 +68,7 @@ def config():
     neighborhood_selection = RANDOM
     # logging
     wandb_logging = False
+    edge_features = False
 
 
 @ex.capture
@@ -74,7 +77,7 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
                          epoch, emb_batch_size, _run: Run, _log: Logger,
                          prefix='', max_num_batches=None,
                          filtering_graph=None, new_entities=None,
-                         return_embeddings=False):
+                         return_embeddings=False, neighborhood_enrichment=False):
     compute_filtered = filtering_graph is not None
     mrr_by_position = torch.zeros(3, dtype=torch.float).to(device)
     mrr_pos_counts = torch.zeros_like(mrr_by_position)
@@ -126,29 +129,27 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
         if isinstance(model, models.InductiveLinkPrediction):
             # Encode with entity descriptions
 
-            #print('batch_ents size', batch_ents.size())
             text_tok, text_mask, text_len = text_dataset.get_entity_description(batch_ents)
-            #print('text_tok size', text_tok.size())
+
+            if neighborhood_enrichment:
+                neighbors = text_dataset.neighbors[batch_ents].view(-1, 2)
 
 
-            neighbors = text_dataset.neighbors[batch_ents].view(-1, 2)
+                # neighbors are split into two columns, one for head and one for tail in order to use the
+                # existing forward function
+                text_tok_neighbors_head, text_mask_neighbors_head, _ = text_dataset.get_entity_description(neighbors[:,0])
+                text_tok_neighbors_tail, text_mask_neighbors_tail, _ = text_dataset.get_entity_description(neighbors[:,1])
 
 
-            # neighbors are split into two columns, one for head and one for tail in order to use the
-            # existing forward function
-            text_tok_neighbors_head, text_mask_neighbors_head, _ = text_dataset.get_entity_description(neighbors[:,0])
-            #print('eval neighbors size:', text_tok_neighbors_head.size())
-            text_tok_neighbors_tail, text_mask_neighbors_tail, _ = text_dataset.get_entity_description(neighbors[:,1])
-
-            #print('text_tok size', text_tok.size())
-            #print('text_tok.unsqueeze(1) size', text_tok.unsqueeze(1).size())
-
-            batch_emb = model(text_tok=text_tok.unsqueeze(1).to(device),
-                              text_mask=text_mask.unsqueeze(1).to(device),
-                              text_tok_neighborhood_head=text_tok_neighbors_head.to(device),
-                              text_mask_neighborhood_head=text_mask_neighbors_head.to(device),
-                              text_tok_neighborhood_tail=text_tok_neighbors_tail.to(device),
-                              text_mask_neighborhood_tail=text_mask_neighbors_tail.to(device))
+                batch_emb = model(text_tok=text_tok.unsqueeze(1).to(device),
+                                  text_mask=text_mask.unsqueeze(1).to(device),
+                                  text_tok_neighborhood_head=text_tok_neighbors_head.to(device),
+                                  text_mask_neighborhood_head=text_mask_neighbors_head.to(device),
+                                  text_tok_neighborhood_tail=text_tok_neighbors_tail.to(device),
+                                  text_mask_neighborhood_tail=text_mask_neighbors_tail.to(device))
+            else:
+                batch_emb = model(text_tok=text_tok.unsqueeze(1).to(device),
+                                  text_mask=text_mask.unsqueeze(1).to(device))
 
             # remove embedded padding
             if padding:
@@ -297,7 +298,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                     use_scheduler, batch_size, emb_batch_size, eval_batch_size,
                     max_epochs, checkpoint, use_cached_text, use_cached_neighbors,
                     neighborhood_enrichment, neighborhood_pooling, fusion_linear,
-                    fusion_gate, num_neighbors, neighborhood_selection, wandb_logging,
+                    fusion_gate, num_neighbors, edge_features, neighborhood_selection, wandb_logging,
                     _run: Run, _log: Logger):
 
     _log.info(f'config: {_run.config}')
@@ -333,8 +334,10 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
     else:
         if model.startswith('bert') or model == 'blp':
             tokenizer = BertTokenizer.from_pretrained(encoder_name)
+            tokenizer_name = encoder_name
         else:
             tokenizer = GloVeTokenizer('data/glove/glove.6B.300d-maps.pt')
+            tokenizer_name = 'glove'
 
         if neighborhood_enrichment:
             print('neighborhood_enrichment:', neighborhood_enrichment)
@@ -346,13 +349,15 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                           use_cached_text=use_cached_text,
                                           use_cached_neighbors=use_cached_neighbors,
                                           num_devices=num_devices,
-                                          device=device)
+                                          device=device,
+                                          tokenizer_name=tokenizer_name)
         else:
             train_data = TextGraphDataset(triples_file, num_negatives,
                                           max_len, tokenizer, drop_stopwords,
                                           write_maps_file=True,
                                           use_cached_text=use_cached_text,
-                                          num_devices=num_devices)
+                                          num_devices=num_devices,
+                                          tokenizer_name=tokenizer_name)
 
     train_loader = DataLoader(train_data, batch_size, shuffle=True,
                               collate_fn=train_data.collate_fn,
@@ -397,7 +402,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
     model = utils.get_model(model, dim, rel_model, loss_fn,
                             len(train_val_test_ent), train_data.num_rels,
                             encoder_name, regularizer, neighborhood_pooling, fusion_linear, fusion_gate,
-                            num_neighbors)
+                            num_neighbors, edge_features)
     if checkpoint is not None:
         model.load_state_dict(torch.load(checkpoint, map_location='cpu'))
 
@@ -412,7 +417,9 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                                     num_warmup_steps=warmup,
                                                     num_training_steps=total_steps)
     best_valid_mrr = 0.0
-    checkpoint_file = osp.join(OUT_PATH, f'model-{_run._id}.pt')
+
+    checkpoint_file = osp.join(OUT_PATH, f'model-{datetime.now().strftime("%Y-%m-%d")}.pt')
+    _log.info(f'checkpoint_file: {checkpoint_file}')
     for epoch in range(1, max_epochs + 1):
         train_loss = 0
 
@@ -420,15 +427,17 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
         #_log.info('Evaluating on validation set')
         #val_mrr, _ = eval_link_prediction(model, valid_loader, train_data,
         #                                  train_val_ent, epoch,
-        #                                  emb_batch_size, prefix='valid')
-
+        #                                  emb_batch_size, prefix='valid',
+        #                                  neighborhood_enrichment=neighborhood_enrichment)
+        #
         #_log.info('Evaluating on test set')
         #_, ent_emb = eval_link_prediction(model, test_loader, train_data,
         #                                  train_val_test_ent, max_epochs + 1,
         #                                  emb_batch_size, prefix='test',
         #                                  filtering_graph=graph,
         #                                  new_entities=test_new_ents,
-        #                                  return_embeddings=True)
+        #                                  return_embeddings=True,
+        #                                  neighborhood_enrichment=neighborhood_enrichment)
         # --- end: added for debugging
 
         for step, data in enumerate(train_loader):
@@ -453,12 +462,12 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
             _log.info('Evaluating on sample of training set')
             eval_link_prediction(model, train_eval_loader, train_data, train_ent,
                                  epoch, emb_batch_size, prefix='train',
-                                 max_num_batches=len(valid_loader))
+                                 max_num_batches=len(valid_loader), neighborhood_enrichment=neighborhood_enrichment)
 
         _log.info('Evaluating on validation set')
         val_mrr, _ = eval_link_prediction(model, valid_loader, train_data,
                                           train_val_ent, epoch,
-                                          emb_batch_size, prefix='valid')
+                                          emb_batch_size, prefix='valid', neighborhood_enrichment=neighborhood_enrichment)
         if wandb_logging:
             wandb.log({"val_mrr": val_mrr, "loss": train_loss / len(train_loader)})
 
@@ -479,7 +488,8 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
     eval_link_prediction(model, valid_loader, train_data, train_val_ent,
                          max_epochs + 1, emb_batch_size, prefix='valid',
                          filtering_graph=graph,
-                         new_entities=val_new_ents)
+                         new_entities=val_new_ents,
+                         neighborhood_enrichment=neighborhood_enrichment)
 
     if dataset == 'Wikidata5M':
         graph = nx.MultiDiGraph()
@@ -491,7 +501,8 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                       emb_batch_size, prefix='test',
                                       filtering_graph=graph,
                                       new_entities=test_new_ents,
-                                      return_embeddings=True)
+                                      return_embeddings=True,
+                                      neighborhood_enrichment=neighborhood_enrichment)
 
     # Save final entity embeddings obtained with trained encoder
     torch.save(ent_emb, osp.join(OUT_PATH, f'ent_emb-{_run._id}.pt'))

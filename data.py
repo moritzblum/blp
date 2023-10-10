@@ -12,6 +12,7 @@ from tqdm import tqdm
 from nltk.corpus import stopwords
 import logging
 from torch_geometric.utils import k_hop_subgraph, subgraph, add_self_loops, to_undirected
+from transformers import BertTokenizer
 
 UNK = '[UNK]'
 nltk.download('stopwords')
@@ -201,7 +202,7 @@ class TextGraphDataset(GraphDataset):
 
     def __init__(self, triples_file, neg_samples, max_len, tokenizer,
                  drop_stopwords, write_maps_file=False, use_cached_text=False,
-                 num_devices=1):
+                 num_devices=1, tokenizer_name='bert-base-uncased'):
         super().__init__(triples_file, neg_samples, write_maps_file,
                          num_devices)
         self.logger = logging.getLogger()
@@ -214,7 +215,8 @@ class TextGraphDataset(GraphDataset):
 
         self.max_len = max_len
 
-        cached_text_path = osp.join(self.directory, 'text_data.pt')
+        cached_text_path = osp.join(self.directory, f'text_data_{tokenizer_name}.pt')
+        self.logger.info(f'Cached text path: {cached_text_path}')
         need_to_load_text = True
         if use_cached_text:
             if osp.exists(cached_text_path):
@@ -280,14 +282,19 @@ class TextGraphDataset(GraphDataset):
                 print(f'Some entries in text_data contain'
                       f' length-0 descriptions.')
 
-            torch.save(self.text_data,
-                       osp.join(self.directory, 'text_data.pt'))
+            torch.save(self.text_data, cached_text_path)
 
-        self.logger.info(f'Adding placeholder value for UNK token: {tokenizer.word2idx[UNK]}')
         placeholder = torch.zeros((1, max_len + 1), dtype=torch.long)
-        placeholder[0][0] = tokenizer.word2idx[UNK]
+        if isinstance(tokenizer, GloVeTokenizer):
+            self.logger.info(f'Adding placeholder value for UNK token: {tokenizer.word2idx[UNK]}')
+            placeholder[0][0] = tokenizer.word2idx[UNK]
+        elif isinstance(tokenizer, BertTokenizer):
+            self.logger.info(f'Adding placeholder value for UNK token: {tokenizer.unk_token_id}')
+            placeholder[0][0] = tokenizer.unk_token_id
+
         placeholder[0][max_len] = 1  # length 1
         self.text_data = torch.cat((self.text_data, placeholder), dim=0)
+
 
     def get_entity_description(self, ent_ids):
         """Get entity descriptions for a tensor of entity IDs."""
@@ -326,7 +333,7 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
     def __init__(self, triples_file, neg_samples, max_len, tokenizer,
                  drop_stopwords, num_neighbors=5, selection=RANDOM, write_maps_file=False,
                  use_cached_text=False, use_cached_neighbors=False,
-                 num_devices=1, device=None):
+                 num_devices=1, device=None, tokenizer_name='bert-base-uncased'):
 
         super().__init__(triples_file, neg_samples, max_len, tokenizer,
                          drop_stopwords, write_maps_file, use_cached_text,

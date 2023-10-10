@@ -1,7 +1,10 @@
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertModel
+import logging
 
 
 class Gate(nn.Module):
@@ -21,8 +24,6 @@ class Gate(nn.Module):
         self.gate_bias = nn.Parameter(torch.zeros(output_size))
 
     def forward(self, x_ent, x_lit):
-        #print_tensor_stats('gate x_ent', x_ent)
-        #print_tensor_stats('gate x_lit', x_lit)
         x = torch.cat([x_ent, x_lit], 1)
         g_embedded = F.tanh(self.g(x))
         gate = self.gate_activation(self.g1(x_ent) + self.g2(x_lit) + self.gate_bias)
@@ -36,17 +37,20 @@ class LinkPrediction(nn.Module):
     embeddings."""
 
     def __init__(self, dim, rel_model, loss_fn, num_relations, regularizer, neighborhood_pooling=False,
-                 linear=False, fusion_gate=False, num_neighbors=5):
+                 linear=False, fusion_gate=False, num_neighbors=5, edge_features=False):
         super().__init__()
+
         print('LinkPrediction', neighborhood_pooling)
         self.dim = dim
         self.normalize_embs = False
         self.regularizer = regularizer
         self.linear = linear
         self.fusion_gate= fusion_gate
-        self.gate = True  # todo make hyperparameter
         self.neighborhood_pooling = neighborhood_pooling
         self.num_neighbors = num_neighbors
+        self.edge_features = edge_features
+
+        self.logger = logging.getLogger()
 
         if rel_model == 'transe':
             self.score_fn = transe_score
@@ -62,6 +66,17 @@ class LinkPrediction(nn.Module):
 
         self.rel_emb = nn.Embedding(num_relations, self.dim)
         nn.init.xavier_uniform_(self.rel_emb.weight.data)
+
+        if edge_features:
+            self.logger.info('Loading relation features from file.')
+
+            self.rel_emb = nn.Sequential(OrderedDict([
+                ('emb', nn.Embedding(num_relations, 768)),
+                ('linear', nn.Linear(768, self.dim))
+            ]))
+
+            relation_desc_features = torch.load('data/Wikidata5M/relation_description_embedding.pt')
+            self.rel_emb.emb.weight.data = relation_desc_features
 
         if self.fusion_gate:
             self.gate = Gate(self.dim * 2, self.dim)
@@ -147,32 +162,18 @@ class InductiveLinkPrediction(LinkPrediction):
             text_tok_neighborhood_head.view(-1, num_text_tokens) torch.Size([batch_size * num_neighbors, max_len])
         """
 
-        print_tensor_stats('model text_tok', text_tok)
-        print_tensor_stats('model text_tok_neighborhood_head', text_tok_neighborhood_head)
-
         batch_size, _, num_text_tokens = text_tok.shape
 
         # Encode text into an entity representation from its description
         ent_embs = self.encode(text_tok.view(-1, num_text_tokens),
                                text_mask.view(-1, num_text_tokens))
 
-        # print('ent_embs before fusion', ent_embs.size())
-
         if text_tok_neighborhood_head is not None:
-            print_tensor_stats('model txt tok regular', text_tok)
-            print_tensor_stats('model txt emb regular', ent_embs)
-            # print('txt tok regular:', text_tok.size(), torch.isnan(text_tok).any(), text_tok)
-            # print('txt emb regular:', ent_embs.size(), torch.isnan(ent_embs).any(), ent_embs)
-
-            print_tensor_stats('model text_tok_neighborhood_head', text_tok_neighborhood_head)
-            print_tensor_stats('model text_tok_neighborhood_tail', text_tok_neighborhood_tail)
             neigh_ent_embs_head = self.encode(text_tok_neighborhood_head.view(-1, num_text_tokens),
                                               text_mask_neighborhood_head.view(-1, num_text_tokens))
 
             neigh_ent_embs_tail = self.encode(text_tok_neighborhood_tail.view(-1, num_text_tokens),
                                               text_mask_neighborhood_tail.view(-1, num_text_tokens))
-
-            print_tensor_stats('model neigh_ent_embs_head', neigh_ent_embs_head)
 
             neigh_ent_embs_head_reshaped = neigh_ent_embs_head.reshape(
                 (-1, self.num_neighbors, self.dim))
@@ -184,37 +185,21 @@ class InductiveLinkPrediction(LinkPrediction):
                 -1, self.dim)
             neigh_ent_embs_tail_avg_pool = self.neighborhood_pooling(neigh_ent_embs_tail_reshaped).view(
                 -1, self.dim)
-            print_tensor_stats('txt emb head pooled', neigh_ent_embs_head_avg_pool)
 
             neigh_ent_embs_pooled = torch.stack(
                 (neigh_ent_embs_head_avg_pool, neigh_ent_embs_tail_avg_pool), dim=1).view(-1, self.dim)
-            print_tensor_stats('txt emb head & tail stacked and reshaped', neigh_ent_embs_pooled)
-            # print('txt emb head & tail stacked and reshaped', neigh_ent_embs_pooled.size(), neigh_ent_embs_pooled)
 
-            # todo new
-            print_tensor_stats('ent_embs', ent_embs)
-            print_tensor_stats('neigh_ent_embs_pooled', neigh_ent_embs_pooled)
-            ent_embs = self.gate(ent_embs, neigh_ent_embs_pooled)
+            if self.fusion_gate:
+                ent_embs = self.gate(ent_embs, neigh_ent_embs_pooled)
 
-            # todo commented for debugging new gate function
-            #ent_embs = torch.cat((ent_embs, neigh_ent_embs_pooled), dim=1)
+            else:
+                ent_embs = torch.cat((ent_embs, neigh_ent_embs_pooled), dim=1)
 
-            # print('txt emb fused', ent_embs.size(), ent_embs)
-            print_tensor_stats('txt emb fused', ent_embs)
-
-            # print('---')
-
-        # print('ent_embs after fusion', ent_embs.size())
-
-        # todo commented for debugging new gate function
         if self.linear:
             ent_embs = self.linear_layer(ent_embs)
 
-        # print('ent_embs after linear', ent_embs.size())
-
         if rels is None and neg_idx is None:
             # Forward is being used to compute entity embeddings only
-            #print('Forward is being used to compute entity embeddings only')
             out = ent_embs
         else:
             # Forward is being used to compute link prediction loss
@@ -250,7 +235,7 @@ class WordEmbeddingsLP(InductiveLinkPrediction):
 
     def __init__(self, rel_model, loss_fn, num_relations, regularizer,
                  dim=None, encoder_name=None, embeddings=None, neighborhood_pooling=False, linear=False,
-                 fusion_gate=False, num_neighbors=5):
+                 fusion_gate=False, num_neighbors=5, edge_features=False):
         print('WordEmbeddingsLP', neighborhood_pooling)
         if not encoder_name and not embeddings:
             raise ValueError('Must provided one of encoder_name or embeddings')
@@ -269,7 +254,7 @@ class WordEmbeddingsLP(InductiveLinkPrediction):
             dim = embeddings.embedding_dim
 
         super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, linear, fusion_gate,
-                         neighborhood_pooling, num_neighbors)
+                         neighborhood_pooling, num_neighbors, edge_features)
 
         self.embeddings = embeddings
 
@@ -285,6 +270,7 @@ class BOW(WordEmbeddingsLP):
         if text_mask is None:
             text_mask = torch.ones_like(text_tok, dtype=torch.float)
         # Extract average of word embeddings
+
         embs = self.embeddings(text_tok)
         lengths = torch.sum(text_mask, dim=-1, keepdim=True)
         embs = torch.sum(text_mask.unsqueeze(dim=-1) * embs, dim=1)
@@ -301,9 +287,11 @@ class DKRL(WordEmbeddingsLP):
     """
 
     def __init__(self, dim, rel_model, loss_fn, num_relations, regularizer,
-                 encoder_name=None, embeddings=None):
+                 encoder_name=None, embeddings=None, neighborhood_pooling=False, linear=False,
+                 fusion_gate=False, num_neighbors=5, edge_features=False):
         super().__init__(rel_model, loss_fn, num_relations, regularizer,
-                         dim, encoder_name, embeddings)
+                         dim, encoder_name, embeddings, neighborhood_pooling, linear, fusion_gate,
+                         num_neighbors, edge_features)
 
         emb_dim = self.embeddings.embedding_dim
         self.conv1 = nn.Conv1d(emb_dim, self.dim, kernel_size=2)
