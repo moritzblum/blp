@@ -37,7 +37,7 @@ class LinkPrediction(nn.Module):
     embeddings."""
 
     def __init__(self, dim, rel_model, loss_fn, num_relations, regularizer, neighborhood_pooling=False,
-                 linear=False, fusion_gate=False, num_neighbors=5, edge_features=False):
+                 linear=False, fusion_gate=False, num_neighbors=5, edge_features=False, weighted_pooling=False):
         super().__init__()
 
         print('LinkPrediction', neighborhood_pooling)
@@ -49,6 +49,7 @@ class LinkPrediction(nn.Module):
         self.neighborhood_pooling = neighborhood_pooling
         self.num_neighbors = num_neighbors
         self.edge_features = edge_features
+        self.weighted_pooling = weighted_pooling
 
         self.logger = logging.getLogger()
 
@@ -146,11 +147,21 @@ def print_tensor_stats(name, tensor):
     pass
 
 
+
 class InductiveLinkPrediction(LinkPrediction):
     """Description-based Link Prediction (DLP)."""
 
     def _encode_entity(self, text_tok, text_mask):
         raise NotImplementedError
+
+    def weighted_neighborhood_pooling(self, features):
+        """
+        features torch.Size([batch_size * num_neighbors, dim])
+        """
+        num_samples = features.size(0)
+        weights = torch.arange(self.num_neighbors, 0, -1).repeat(self.dim, 1).T.repeat(num_samples, 1).reshape(-1, self.num_neighbors, self.dim).to(features.device)
+        avg = torch.sum(weights * features, dim=1) / torch.sum(weights, dim=1)
+        return avg
 
     def forward(self, text_tok, text_mask, rels=None, neg_idx=None, text_tok_neighborhood_head=None,
                 text_mask_neighborhood_head=None, text_tok_neighborhood_tail=None,
@@ -169,22 +180,28 @@ class InductiveLinkPrediction(LinkPrediction):
                                text_mask.view(-1, num_text_tokens))
 
         if text_tok_neighborhood_head is not None:
-            neigh_ent_embs_head = self.encode(text_tok_neighborhood_head.view(-1, num_text_tokens),
-                                              text_mask_neighborhood_head.view(-1, num_text_tokens))
+            with torch.no_grad():
+                neigh_ent_embs_head = self.encode(text_tok_neighborhood_head.view(-1, num_text_tokens),
+                                                  text_mask_neighborhood_head.view(-1, num_text_tokens))
 
-            neigh_ent_embs_tail = self.encode(text_tok_neighborhood_tail.view(-1, num_text_tokens),
-                                              text_mask_neighborhood_tail.view(-1, num_text_tokens))
+                neigh_ent_embs_tail = self.encode(text_tok_neighborhood_tail.view(-1, num_text_tokens),
+                                                  text_mask_neighborhood_tail.view(-1, num_text_tokens))
 
             neigh_ent_embs_head_reshaped = neigh_ent_embs_head.reshape(
                 (-1, self.num_neighbors, self.dim))
             neigh_ent_embs_tail_reshaped = neigh_ent_embs_tail.reshape(
                 (-1, self.num_neighbors, self.dim))
 
-            # todo make pooling function a hyperparameter
-            neigh_ent_embs_head_avg_pool = self.neighborhood_pooling(neigh_ent_embs_head_reshaped).view(
-                -1, self.dim)
-            neigh_ent_embs_tail_avg_pool = self.neighborhood_pooling(neigh_ent_embs_tail_reshaped).view(
-                -1, self.dim)
+            if self.weighted_pooling:
+                neigh_ent_embs_head_avg_pool = self.weighted_neighborhood_pooling(
+                    neigh_ent_embs_head_reshaped).view(-1, self.dim)
+                neigh_ent_embs_tail_avg_pool = self.weighted_neighborhood_pooling(
+                    neigh_ent_embs_tail_reshaped).view(-1, self.dim)
+            else:
+                neigh_ent_embs_head_avg_pool = self.neighborhood_pooling(neigh_ent_embs_head_reshaped).view(
+                    -1, self.dim)
+                neigh_ent_embs_tail_avg_pool = self.neighborhood_pooling(neigh_ent_embs_tail_reshaped).view(
+                    -1, self.dim)
 
             neigh_ent_embs_pooled = torch.stack(
                 (neigh_ent_embs_head_avg_pool, neigh_ent_embs_tail_avg_pool), dim=1).view(-1, self.dim)
@@ -213,8 +230,10 @@ class BertEmbeddingsLP(InductiveLinkPrediction):
     """BERT for Link Prediction (BLP)."""
 
     def __init__(self, dim, rel_model, loss_fn, num_relations, encoder_name,
-                 regularizer):
-        super().__init__(dim, rel_model, loss_fn, num_relations, regularizer)
+                 regularizer, neighborhood_pooling=False, linear=False,
+                 fusion_gate=False, num_neighbors=5, edge_features=False, weighted_pooling=False):
+        super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, linear, fusion_gate,
+                         neighborhood_pooling, num_neighbors, edge_features, weighted_pooling)
         self.encoder = BertModel.from_pretrained(encoder_name,
                                                  output_attentions=False,
                                                  output_hidden_states=False)
@@ -235,7 +254,7 @@ class WordEmbeddingsLP(InductiveLinkPrediction):
 
     def __init__(self, rel_model, loss_fn, num_relations, regularizer,
                  dim=None, encoder_name=None, embeddings=None, neighborhood_pooling=False, linear=False,
-                 fusion_gate=False, num_neighbors=5, edge_features=False):
+                 fusion_gate=False, num_neighbors=5, edge_features=False, weighted_pooling=False):
         print('WordEmbeddingsLP', neighborhood_pooling)
         if not encoder_name and not embeddings:
             raise ValueError('Must provided one of encoder_name or embeddings')
@@ -254,7 +273,7 @@ class WordEmbeddingsLP(InductiveLinkPrediction):
             dim = embeddings.embedding_dim
 
         super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, linear, fusion_gate,
-                         neighborhood_pooling, num_neighbors, edge_features)
+                         neighborhood_pooling, num_neighbors, edge_features, weighted_pooling)
 
         self.embeddings = embeddings
 
@@ -288,10 +307,10 @@ class DKRL(WordEmbeddingsLP):
 
     def __init__(self, dim, rel_model, loss_fn, num_relations, regularizer,
                  encoder_name=None, embeddings=None, neighborhood_pooling=False, linear=False,
-                 fusion_gate=False, num_neighbors=5, edge_features=False):
+                 fusion_gate=False, num_neighbors=5, edge_features=False, weighted_pooling=False):
         super().__init__(rel_model, loss_fn, num_relations, regularizer,
                          dim, encoder_name, embeddings, neighborhood_pooling, linear, fusion_gate,
-                         num_neighbors, edge_features)
+                         num_neighbors, edge_features, weighted_pooling)
 
         emb_dim = self.embeddings.embedding_dim
         self.conv1 = nn.Conv1d(emb_dim, self.dim, kernel_size=2)

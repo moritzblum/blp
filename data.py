@@ -333,11 +333,11 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
     def __init__(self, triples_file, neg_samples, max_len, tokenizer,
                  drop_stopwords, num_neighbors=5, selection=RANDOM, write_maps_file=False,
                  use_cached_text=False, use_cached_neighbors=False,
-                 num_devices=1, device=None, tokenizer_name='bert-base-uncased'):
+                 num_devices=1, device=None, tokenizer_name='bert-base-uncased', dataset_name='wikidata5m'):
 
         super().__init__(triples_file, neg_samples, max_len, tokenizer,
                          drop_stopwords, write_maps_file, use_cached_text,
-                         num_devices)
+                         num_devices, tokenizer_name)
 
         self.device = device
         self.num_neighbors = num_neighbors
@@ -353,19 +353,17 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         # just for debugging
         if not use_cached_neighbors:
 
-            # todo not yet needed to compute every run as we are using only the one hop neighborhood
-            #self.load_page_link_graph_inductive(osp.join('./data/Wikidata5M', 'page_links_typed.pt'),
-            #                                    osp.join('./data/Wikidata5M',
-            #                                             'inductive_page_links_typed.pt'),
-            #                                    set(train_entities))
+            self.load_page_link_graph_inductive(osp.join(self.directory, 'page_link_graph_typed.txt'),
+                                                osp.join(self.directory, 'inductive_page_link_graph_typed.pt'),
+                                                set(train_entities))
 
-            #self.page_link_graph_edge_index = torch.stack(
-            #    [self.page_link_graph[:, 0], self.page_link_graph[:, 2]]).to(self.device)
-            #self.page_link_graph_edge_type = self.page_link_graph[:, 1].to(self.device)
-            # -> end block
+            self.page_link_graph_edge_index = torch.stack(
+                [self.page_link_graph[:, 0], self.page_link_graph[:, 2]]).to(self.device)
+            self.page_link_graph_edge_type = self.page_link_graph[:, 1].to(self.device)
 
-            pre_computed_direct_neighborhood_file = osp.join('./data/Wikidata5M',
-                                                      'pre_computed_direct_neighborhood.pt')
+            pre_computed_direct_neighborhood_file = osp.join(self.directory,
+                                                             'pre_computed_direct_neighborhood.pt')
+
             if not osp.exists(pre_computed_direct_neighborhood_file):
                 self.logger.info('Pre-computing neighborhood.')
                 neighbor_dict = {}
@@ -396,10 +394,10 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
                 neighbor_tensor[ent_id, :min(neighbors_list_ordered.shape[0], max_relevant_neighbors)] = neighbors_list_ordered[
                                                                                             :max_relevant_neighbors]
 
-            torch.save(neighbor_tensor, osp.join('./data/Wikidata5M', 'neighbors_tmp.pt'))
+            torch.save(neighbor_tensor, osp.join(self.directory, 'neighbors_tmp.pt'))
         else:
             self.logger.info('Attention: Loading pre-computed neighborhood for debugging.')
-            neighbor_tensor = torch.load(osp.join('./data/Wikidata5M', 'neighbors_tmp.pt'))
+            neighbor_tensor = torch.load(osp.join(self.directory, 'neighbors_tmp.pt'))
 
         self.neighbors = neighbor_tensor[:, :self.num_neighbors]
 
@@ -436,20 +434,21 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
             self.page_link_graph = torch.load(processed_file_path)
         else:
             maps = torch.load(self.maps_path)
-            blp_ent_ids = maps['ent_ids']
-            blp_rel_ids = maps['rel_ids']
+            ent_uri_2_id = maps['ent_ids']
+            rel_uri_2_id = maps['rel_ids']
 
             page_links_graph_raw = []
             skipped = 0
+            print(raw_file_path)
             with open(raw_file_path) as page_linkes_raw_in:
                 for line in page_linkes_raw_in:
                     head, relation, tail = line.strip().split('\t')
-                    if head not in blp_ent_ids or tail not in blp_ent_ids:
+                    if head not in ent_uri_2_id or tail not in ent_uri_2_id:
                         skipped += 1
                         continue
 
                     page_links_graph_raw.append(
-                        [blp_ent_ids[head], blp_rel_ids[relation], blp_ent_ids[tail]])
+                        [ent_uri_2_id[head], rel_uri_2_id[relation], ent_uri_2_id[tail]])
             print('Skipped', skipped, 'triples because of missing entities.')
 
             page_links_graph_raw = torch.tensor(page_links_graph_raw, dtype=torch.long)

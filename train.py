@@ -1,5 +1,7 @@
 import os
 import os.path as osp
+import random
+import string
 from datetime import datetime
 
 import networkx as nx
@@ -69,6 +71,7 @@ def config():
     # logging
     wandb_logging = False
     edge_features = False
+    weighted_pooling = False
 
 
 @ex.capture
@@ -121,7 +124,6 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
 
         # add padding to even size for allowing reshaping and splitting of the neighbors
         padding = batch_ents.size(0) % 2 == 1
-        print('padding batch for neighborhood splitting:', padding)
 
         if padding:
             batch_ents = torch.cat((batch_ents, batch_ents[-1].unsqueeze(0)))
@@ -298,7 +300,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                     use_scheduler, batch_size, emb_batch_size, eval_batch_size,
                     max_epochs, checkpoint, use_cached_text, use_cached_neighbors,
                     neighborhood_enrichment, neighborhood_pooling, fusion_linear,
-                    fusion_gate, num_neighbors, edge_features, neighborhood_selection, wandb_logging,
+                    fusion_gate, num_neighbors, edge_features, weighted_pooling, neighborhood_selection, wandb_logging,
                     _run: Run, _log: Logger):
 
     _log.info(f'config: {_run.config}')
@@ -402,7 +404,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
     model = utils.get_model(model, dim, rel_model, loss_fn,
                             len(train_val_test_ent), train_data.num_rels,
                             encoder_name, regularizer, neighborhood_pooling, fusion_linear, fusion_gate,
-                            num_neighbors, edge_features)
+                            num_neighbors, edge_features, weighted_pooling)
     if checkpoint is not None:
         model.load_state_dict(torch.load(checkpoint, map_location='cpu'))
 
@@ -418,7 +420,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                                     num_training_steps=total_steps)
     best_valid_mrr = 0.0
 
-    checkpoint_file = osp.join(OUT_PATH, f'model-{datetime.now().strftime("%Y-%m-%d")}.pt')
+    checkpoint_file = osp.join(OUT_PATH, f'model-{encoder_name}-{datetime.now().strftime("%Y-%m-%d-%H-%M")}-{"".join([random.choice(string.ascii_lowercase) for _ in range(6)])}.pt')
     _log.info(f'checkpoint_file: {checkpoint_file}')
     for epoch in range(1, max_epochs + 1):
         train_loss = 0
@@ -429,7 +431,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
         #                                  train_val_ent, epoch,
         #                                  emb_batch_size, prefix='valid',
         #                                  neighborhood_enrichment=neighborhood_enrichment)
-        #
+
         #_log.info('Evaluating on test set')
         #_, ent_emb = eval_link_prediction(model, test_loader, train_data,
         #                                  train_val_test_ent, max_epochs + 1,
