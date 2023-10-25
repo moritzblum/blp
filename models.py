@@ -36,37 +36,37 @@ class LinkPrediction(nn.Module):
     """A general link prediction model with a lookup table for relation
     embeddings."""
 
-    def __init__(self, dim, rel_model, loss_fn, num_relations, regularizer, neighborhood_pooling=False,
-                 linear=False, fusion_gate=False, num_neighbors=5, edge_features=False, weighted_pooling=False):
+    def score_fn(self, heads, tails, rels, eval=False):
+        if self.rel_model == 'transe':
+            self.normalize_embs = True
+            return self.transe_score(heads, tails, rels, eval)
+        elif self.rel_model == 'distmult':
+            return self.distmult_score(heads, tails, rels, eval)
+        elif self.rel_model == 'complex':
+            return self.complex_score(heads, tails, rels, eval)
+        elif self.rel_model == 'simple':
+            return self.simple_score(heads, tails, rels, eval)
+        elif self.rel_model == 'ermlp':
+            return self.ermlp_score(heads, tails, rels, eval)
+        else:
+            raise ValueError(f'Unknown relational model {self.rel_model}.')
+
+    def __init__(self, dim, rel_model, loss_fn, num_relations, regularizer,
+                 num_neighbors=5, fusion_method='BERT', edge_features=False, weighted_pooling=False):
+
         super().__init__()
 
-        print('LinkPrediction', neighborhood_pooling)
         self.dim = dim
         self.normalize_embs = False
         self.regularizer = regularizer
-        self.linear = linear
-        self.fusion_gate= fusion_gate
-        self.neighborhood_pooling = neighborhood_pooling
+        self.rel_model = rel_model
         self.num_neighbors = num_neighbors
-        self.edge_features = edge_features
+        self.fusion_method = fusion_method  # 'BERT' or 'linear' or 'gate'
         self.weighted_pooling = weighted_pooling
-
+        self.edge_features = edge_features
         self.logger = logging.getLogger()
 
-        if rel_model == 'transe':
-            self.score_fn = transe_score
-            self.normalize_embs = True
-        elif rel_model == 'distmult':
-            self.score_fn = distmult_score
-        elif rel_model == 'complex':
-            self.score_fn = complex_score
-        elif rel_model == 'simple':
-            self.score_fn = simple_score
-        else:
-            raise ValueError(f'Unknown relational model {rel_model}.')
 
-        self.rel_emb = nn.Embedding(num_relations, self.dim)
-        nn.init.xavier_uniform_(self.rel_emb.weight.data)
 
         if edge_features:
             self.logger.info('Loading relation features from file.')
@@ -78,17 +78,19 @@ class LinkPrediction(nn.Module):
 
             relation_desc_features = torch.load('data/Wikidata5M/relation_description_embedding.pt')
             self.rel_emb.emb.weight.data = relation_desc_features
+        else:
+            self.rel_emb = nn.Embedding(num_relations, self.dim)
+            nn.init.xavier_uniform_(self.rel_emb.weight.data)
 
-        if self.fusion_gate:
+        if self.fusion_method == 'gate':
             self.gate = Gate(self.dim * 2, self.dim)
 
-        if self.linear:
-            if self.neighborhood_pooling and not self.fusion_gate:
-                # linear layer is used for fusion
-                self.linear_layer = nn.Linear(self.dim * 2, self.dim)
-            else:
-                self.linear_layer = nn.Linear(self.dim, self.dim)
+        if self.fusion_method == 'linear':
+            self.linear_layer = nn.Linear(self.dim * 2, self.dim)
 
+        if self.rel_model == 'ermlp':
+            self.ermlp_linear_hidden = nn.Linear(self.dim * 3, self.dim)
+            self.ermlp_linear_out = nn.Linear(self.dim, 1)
 
         self.neighborhood_pooling = torch.nn.AvgPool2d((self.num_neighbors, 1), stride=1)
 
@@ -141,6 +143,49 @@ class LinkPrediction(nn.Module):
         model_loss = self.loss_fn(pos_scores, neg_scores)
         return model_loss + reg_loss
 
+    def transe_score(self, heads, tails, rels, eval=False):
+        return -torch.norm(heads + rels - tails, dim=-1, p=1)
+
+    def distmult_score(self, heads, tails, rels, eval=False):
+        return torch.sum(heads * rels * tails, dim=-1)
+
+    def complex_score(self, heads, tails, rels, eval=False):
+        heads_re, heads_im = torch.chunk(heads, chunks=2, dim=-1)
+        tails_re, tails_im = torch.chunk(tails, chunks=2, dim=-1)
+        rels_re, rels_im = torch.chunk(rels, chunks=2, dim=-1)
+
+        return torch.sum(rels_re * heads_re * tails_re +
+                         rels_re * heads_im * tails_im +
+                         rels_im * heads_re * tails_im -
+                         rels_im * heads_im * tails_re,
+                         dim=-1)
+
+    def simple_score(self, heads, tails, rels, eval=False):
+        heads_h, heads_t = torch.chunk(heads, chunks=2, dim=-1)
+        tails_h, tails_t = torch.chunk(tails, chunks=2, dim=-1)
+        rel_a, rel_b = torch.chunk(rels, chunks=2, dim=-1)
+
+        return torch.sum(heads_h * rel_a * tails_t +
+                         tails_h * rel_b * heads_t, dim=-1) / 2
+
+    def ermlp_score(self, heads, tails, rels, eval=False):
+
+        batch_size = heads.size(0)
+        num_samples = heads.size(1)
+        if not eval:
+            rels = rels.repeat(1, heads.size(1), 1)
+        linear_input = torch.cat([heads.reshape((-1, self.dim)),
+                                  rels.reshape((-1, self.dim)),
+                                  tails.reshape((-1, self.dim))], dim=-1)
+        linear_hidden = self.ermlp_linear_hidden(linear_input)
+        linear_hidden = torch.tanh(linear_hidden)
+        linear_out = self.ermlp_linear_out(linear_hidden)
+        #linear_out = torch.sigmoid(linear_out)
+        linear_out = linear_out.reshape((batch_size, num_samples))
+        return linear_out
+
+
+
 
 def print_tensor_stats(name, tensor):
     # print(f'{name} size: {tensor.size()}, nan: {torch.isnan(tensor).any()}, inf: {torch.isinf(tensor).any()}', tensor)
@@ -175,45 +220,70 @@ class InductiveLinkPrediction(LinkPrediction):
 
         batch_size, _, num_text_tokens = text_tok.shape
 
-        # Encode text into an entity representation from its description
-        ent_embs = self.encode(text_tok.view(-1, num_text_tokens),
-                               text_mask.view(-1, num_text_tokens))
+        if text_tok_neighborhood_head is None:
+            # without neighborhood
+            # Encode text into an entity representation from its description
+            ent_embs = self.encode(text_tok.view(-1, num_text_tokens),
+                                   text_mask.view(-1, num_text_tokens))
+        else:
+            # with neighborhood
+            if self.fusion_method == 'BERT':
+                # uses tokenizer.sep_token_id = 102 for separating neighbors
+                # neigh_head_tail torch.Size([batch_size, 2 * num_neighbors, max_len])
+                neigh_head_tail = torch.cat([text_tok_neighborhood_head, text_tok_neighborhood_tail], dim=1)
+                # add sep token between neighbors torch.Size([batch_size, 2 * num_neighbors, max_len + 1])
+                neigh_head_tail = torch.cat([neigh_head_tail, torch.full((neigh_head_tail.size(0), neigh_head_tail.size(1), 1), 102).to(neigh_head_tail.device)], dim=2)
 
-        if text_tok_neighborhood_head is not None:
-            with torch.no_grad():
-                neigh_ent_embs_head = self.encode(text_tok_neighborhood_head.view(-1, num_text_tokens),
-                                                  text_mask_neighborhood_head.view(-1, num_text_tokens))
+                neigh_head_tail_mask = torch.cat([text_mask_neighborhood_head,text_mask_neighborhood_tail], dim=1)
+                neigh_head_tail_mask = torch.cat([neigh_head_tail_mask, torch.ones((neigh_head_tail_mask.size(0), neigh_head_tail_mask.size(1), 1)).to(neigh_head_tail_mask.device)], dim=2)  # add sep token between neighbors mask
 
-                neigh_ent_embs_tail = self.encode(text_tok_neighborhood_tail.view(-1, num_text_tokens),
-                                                  text_mask_neighborhood_tail.view(-1, num_text_tokens))
+                ent_feature = torch.cat([text_tok.view(-1, num_text_tokens),
+                                         torch.full((text_tok.size(0) * 2, 1), 102).to(text_tok.device),
+                                         neigh_head_tail.view(-1, self.num_neighbors * num_text_tokens + self.num_neighbors)], dim=1)
 
-            neigh_ent_embs_head_reshaped = neigh_ent_embs_head.reshape(
-                (-1, self.num_neighbors, self.dim))
-            neigh_ent_embs_tail_reshaped = neigh_ent_embs_tail.reshape(
-                (-1, self.num_neighbors, self.dim))
+                ent_feature_mask = torch.cat([text_mask.view(-1, num_text_tokens),
+                                              torch.full((text_mask.size(0) * 2, 1), 1).to(text_mask.device),
+                                              neigh_head_tail_mask.view(-1, self.num_neighbors * num_text_tokens + self.num_neighbors)], dim=1)
 
-            if self.weighted_pooling:
-                neigh_ent_embs_head_avg_pool = self.weighted_neighborhood_pooling(
-                    neigh_ent_embs_head_reshaped).view(-1, self.dim)
-                neigh_ent_embs_tail_avg_pool = self.weighted_neighborhood_pooling(
-                    neigh_ent_embs_tail_reshaped).view(-1, self.dim)
-            else:
-                neigh_ent_embs_head_avg_pool = self.neighborhood_pooling(neigh_ent_embs_head_reshaped).view(
-                    -1, self.dim)
-                neigh_ent_embs_tail_avg_pool = self.neighborhood_pooling(neigh_ent_embs_tail_reshaped).view(
-                    -1, self.dim)
+                ent_embs = self.encode(ent_feature,
+                                       ent_feature_mask)
 
-            neigh_ent_embs_pooled = torch.stack(
-                (neigh_ent_embs_head_avg_pool, neigh_ent_embs_tail_avg_pool), dim=1).view(-1, self.dim)
+            elif self.fusion_method in ['linear', 'gate']:
+                # Encode text into an entity representation from its description
+                ent_embs = self.encode(text_tok.view(-1, num_text_tokens),
+                                       text_mask.view(-1, num_text_tokens))
 
-            if self.fusion_gate:
-                ent_embs = self.gate(ent_embs, neigh_ent_embs_pooled)
+                with torch.no_grad():
+                    neigh_ent_embs_head = self.encode(text_tok_neighborhood_head.view(-1, num_text_tokens),
+                                                      text_mask_neighborhood_head.view(-1, num_text_tokens))
 
-            else:
-                ent_embs = torch.cat((ent_embs, neigh_ent_embs_pooled), dim=1)
+                    neigh_ent_embs_tail = self.encode(text_tok_neighborhood_tail.view(-1, num_text_tokens),
+                                                      text_mask_neighborhood_tail.view(-1, num_text_tokens))
 
-        if self.linear:
-            ent_embs = self.linear_layer(ent_embs)
+                neigh_ent_embs_head_reshaped = neigh_ent_embs_head.reshape(
+                    (-1, self.num_neighbors, self.dim))
+                neigh_ent_embs_tail_reshaped = neigh_ent_embs_tail.reshape(
+                    (-1, self.num_neighbors, self.dim))
+
+                if self.weighted_pooling:
+                    neigh_ent_embs_head_avg_pool = self.weighted_neighborhood_pooling(
+                        neigh_ent_embs_head_reshaped).view(-1, self.dim)
+                    neigh_ent_embs_tail_avg_pool = self.weighted_neighborhood_pooling(
+                        neigh_ent_embs_tail_reshaped).view(-1, self.dim)
+                else:
+                    neigh_ent_embs_head_avg_pool = self.neighborhood_pooling(neigh_ent_embs_head_reshaped).view(
+                        -1, self.dim)
+                    neigh_ent_embs_tail_avg_pool = self.neighborhood_pooling(neigh_ent_embs_tail_reshaped).view(
+                        -1, self.dim)
+
+                neigh_ent_embs_pooled = torch.stack(
+                    (neigh_ent_embs_head_avg_pool, neigh_ent_embs_tail_avg_pool), dim=1).view(-1, self.dim)
+
+                if self.fusion_method == 'gate':
+                    ent_embs = self.gate(ent_embs, neigh_ent_embs_pooled)
+
+                else:
+                    ent_embs = self.linear_layer(torch.cat((ent_embs, neigh_ent_embs_pooled), dim=1))
 
         if rels is None and neg_idx is None:
             # Forward is being used to compute entity embeddings only
@@ -230,10 +300,9 @@ class BertEmbeddingsLP(InductiveLinkPrediction):
     """BERT for Link Prediction (BLP)."""
 
     def __init__(self, dim, rel_model, loss_fn, num_relations, encoder_name,
-                 regularizer, neighborhood_pooling=False, linear=False,
-                 fusion_gate=False, num_neighbors=5, edge_features=False, weighted_pooling=False):
-        super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, linear, fusion_gate,
-                         neighborhood_pooling, num_neighbors, edge_features, weighted_pooling)
+                 regularizer, num_neighbors=5, fusion_method='BERT', edge_features=False, weighted_pooling=False):
+        super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, num_neighbors,
+                         fusion_method, edge_features, weighted_pooling)
         self.encoder = BertModel.from_pretrained(encoder_name,
                                                  output_attentions=False,
                                                  output_hidden_states=False)
@@ -253,9 +322,8 @@ class WordEmbeddingsLP(InductiveLinkPrediction):
     """
 
     def __init__(self, rel_model, loss_fn, num_relations, regularizer,
-                 dim=None, encoder_name=None, embeddings=None, neighborhood_pooling=False, linear=False,
-                 fusion_gate=False, num_neighbors=5, edge_features=False, weighted_pooling=False):
-        print('WordEmbeddingsLP', neighborhood_pooling)
+                 dim=None, encoder_name=None, embeddings=None, num_neighbors=5, fusion_method='BERT', edge_features=False,
+                 weighted_pooling=False):
         if not encoder_name and not embeddings:
             raise ValueError('Must provided one of encoder_name or embeddings')
 
@@ -272,8 +340,8 @@ class WordEmbeddingsLP(InductiveLinkPrediction):
         if dim is None:
             dim = embeddings.embedding_dim
 
-        super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, linear, fusion_gate,
-                         neighborhood_pooling, num_neighbors, edge_features, weighted_pooling)
+        super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, num_neighbors,
+                         fusion_method, edge_features, weighted_pooling)
 
         self.embeddings = embeddings
 
@@ -306,11 +374,11 @@ class DKRL(WordEmbeddingsLP):
     """
 
     def __init__(self, dim, rel_model, loss_fn, num_relations, regularizer,
-                 encoder_name=None, embeddings=None, neighborhood_pooling=False, linear=False,
-                 fusion_gate=False, num_neighbors=5, edge_features=False, weighted_pooling=False):
+                 encoder_name=None, embeddings=None, num_neighbors=5, fusion_method='BERT', edge_features=False,
+                 weighted_pooling=False):
         super().__init__(rel_model, loss_fn, num_relations, regularizer,
-                         dim, encoder_name, embeddings, neighborhood_pooling, linear, fusion_gate,
-                         num_neighbors, edge_features, weighted_pooling)
+                         dim, encoder_name, embeddings,
+                         num_neighbors, fusion_method, edge_features, weighted_pooling)
 
         emb_dim = self.embeddings.embedding_dim
         self.conv1 = nn.Conv1d(emb_dim, self.dim, kernel_size=2)
@@ -362,35 +430,6 @@ class TransductiveLinkPrediction(LinkPrediction):
     def forward(self, pos_pairs, rels, neg_idx):
         embs = self.encode(pos_pairs)
         return self.compute_loss(embs, rels, neg_idx)
-
-
-def transe_score(heads, tails, rels):
-    return -torch.norm(heads + rels - tails, dim=-1, p=1)
-
-
-def distmult_score(heads, tails, rels):
-    return torch.sum(heads * rels * tails, dim=-1)
-
-
-def complex_score(heads, tails, rels):
-    heads_re, heads_im = torch.chunk(heads, chunks=2, dim=-1)
-    tails_re, tails_im = torch.chunk(tails, chunks=2, dim=-1)
-    rels_re, rels_im = torch.chunk(rels, chunks=2, dim=-1)
-
-    return torch.sum(rels_re * heads_re * tails_re +
-                     rels_re * heads_im * tails_im +
-                     rels_im * heads_re * tails_im -
-                     rels_im * heads_im * tails_re,
-                     dim=-1)
-
-
-def simple_score(heads, tails, rels):
-    heads_h, heads_t = torch.chunk(heads, chunks=2, dim=-1)
-    tails_h, tails_t = torch.chunk(tails, chunks=2, dim=-1)
-    rel_a, rel_b = torch.chunk(rels, chunks=2, dim=-1)
-
-    return torch.sum(heads_h * rel_a * tails_t +
-                     tails_h * rel_b * heads_t, dim=-1) / 2
 
 
 def margin_loss(pos_scores, neg_scores):

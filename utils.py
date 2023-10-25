@@ -4,23 +4,22 @@ import models
 
 
 def get_model(model, dim, rel_model, loss_fn, num_entities, num_relations, encoder_name, regularizer,
-              neighborhood_pooling, fusion_linear, fusion_gate, num_neighbors, edge_features, weighted_pooling):
-    # todo Attention: fusion only implemented for bow models
+              num_neighbors, fusion_method, edge_features, weighted_pooling):
     if model == 'blp':
         return models.BertEmbeddingsLP(dim, rel_model, loss_fn, num_relations,
-                                       encoder_name, regularizer, neighborhood_pooling=neighborhood_pooling, linear=fusion_linear, fusion_gate=fusion_gate, num_neighbors=num_neighbors, edge_features=edge_features, weighted_pooling=weighted_pooling)
+                                       encoder_name, regularizer, num_neighbors=num_neighbors, fusion_method=fusion_method, edge_features=edge_features, weighted_pooling=weighted_pooling)
     elif model == 'bert-bow':
         return models.BOW(rel_model, loss_fn, num_relations, regularizer,
-                          encoder_name=encoder_name, neighborhood_pooling=neighborhood_pooling, linear=fusion_linear, fusion_gate=fusion_gate, num_neighbors=num_neighbors, edge_features=edge_features, weighted_pooling=weighted_pooling)
+                          encoder_name=encoder_name, num_neighbors=num_neighbors, fusion_method=fusion_method, edge_features=edge_features, weighted_pooling=weighted_pooling)
     elif model == 'bert-dkrl':
         return models.DKRL(dim, rel_model, loss_fn, num_relations, regularizer,
-                           encoder_name=encoder_name, neighborhood_pooling=neighborhood_pooling, linear=fusion_linear, fusion_gate=fusion_gate, num_neighbors=num_neighbors, edge_features=edge_features, weighted_pooling=weighted_pooling)
+                           encoder_name=encoder_name, num_neighbors=num_neighbors, fusion_method=fusion_method, edge_features=edge_features, weighted_pooling=weighted_pooling)
     elif model == 'glove-bow':
         return models.BOW(rel_model, loss_fn, num_relations, regularizer,
-                          embeddings='data/glove/glove.6B.300d.pt', neighborhood_pooling=neighborhood_pooling, linear=fusion_linear, fusion_gate=fusion_gate, num_neighbors=num_neighbors, edge_features=edge_features, weighted_pooling=weighted_pooling)
+                          embeddings='data/glove/glove.6B.300d.pt', num_neighbors=num_neighbors, fusion_method=fusion_method, edge_features=edge_features, weighted_pooling=weighted_pooling)
     elif model == 'glove-dkrl':
         return models.DKRL(dim, rel_model, loss_fn, num_relations, regularizer,
-                           embeddings='data/glove/glove.6B.300d.pt', neighborhood_pooling=neighborhood_pooling, linear=fusion_linear, fusion_gate=fusion_gate, num_neighbors=num_neighbors, edge_features=edge_features, weighted_pooling=weighted_pooling)
+                           embeddings='data/glove/glove.6B.300d.pt', num_neighbors=num_neighbors, fusion_method=fusion_method, edge_features=edge_features, weighted_pooling=weighted_pooling)
     elif model == 'transductive':
         return models.TransductiveLinkPrediction(dim, rel_model, loss_fn,
                                                  num_entities, num_relations,
