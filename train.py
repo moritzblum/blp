@@ -37,6 +37,42 @@ if all([uri, database]):
     ex.observers.append(MongoObserver(uri, database))
 
 
+
+"""
+env (GPU Cluster): lp
+
+best performing model so far: 
+slurm_blp-fb15k237_transe_bert.sh
+
+python train.py link_prediction with \
+dataset='FB15k-237' \
+inductive=True \
+dim=128 \
+model='blp' \
+rel_model='transe' \
+loss_fn='margin' \
+encoder_name='bert-base-cased' \
+regularizer=0 \
+max_len=32 \
+num_negatives=64 \
+lr=2e-5 \
+use_scheduler=True \
+batch_size=64 \
+emb_batch_size=512 \
+eval_batch_size=64 \
+max_epochs=40 \
+checkpoint=None \
+use_cached_text=True \
+use_cached_neighbors=True \
+neighborhood_enrichment=True \
+fusion_method='BERT' \
+num_neighbors=3 \
+neighborhood_selection='degree_train' \
+wandb_logging=True \
+
+"""
+
+
 @ex.config
 def config():
     dataset = 'umls'
@@ -76,6 +112,7 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
                          prefix='', max_num_batches=None,
                          filtering_graph=None, new_entities=None,
                          return_embeddings=False, neighborhood_enrichment=False, fusion_method=None):
+    scores = {}
     compute_filtered = filtering_graph is not None
     mrr_by_position = torch.zeros(3, dtype=torch.float).to(device)
     mrr_pos_counts = torch.zeros_like(mrr_by_position)
@@ -129,6 +166,7 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
             text_tok, text_mask, text_len = text_dataset.get_entity_description(batch_ents)
 
             if neighborhood_enrichment:
+                # todo change neighbor to get_neighbor function
                 neighbors = text_dataset.neighbors[batch_ents].view(-1, 2)
 
                 # neighbors are split into two columns, one for head and one for tail in order to use the
@@ -172,11 +210,21 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
     num_predictions = 0
     _log.info('Computing metrics on set of triples')
     total = len(triples_loader) if max_num_batches is None else max_num_batches
+
+    triple_ranks_all = []
+    triple_ranks_filtered_all = []
     for i, triples in enumerate(triples_loader):
+        # todo remove after debugging
+        #if i == 2:
+        #    break
+
         if max_num_batches is not None and i == max_num_batches:
             break
 
         heads, tails, rels = torch.chunk(triples, chunks=3, dim=1)
+
+        t = torch.cat((heads, rels, tails), dim=1)
+
         # Map entity IDs to positions in ent_emb
         heads = ent2idx[heads].to(device)
         tails = ent2idx[tails].to(device)
@@ -202,7 +250,13 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
         true_ents = torch.cat((heads, tails))
 
         num_predictions += pred_ents.shape[0]
-        reciprocals, hits = utils.get_metrics(pred_ents, true_ents, k_values)
+        reciprocals, hits, ranks = utils.get_metrics(pred_ents, true_ents, k_values)
+        ranks = torch.reshape(ranks, (2, -1))
+
+        triple_ranks = torch.cat((t, ranks[0].unsqueeze(1).cpu(), ranks[1].unsqueeze(1).cpu()),
+                                          dim=1).type(torch.int32)
+        triple_ranks_all.append(triple_ranks)
+
         mrr += reciprocals.sum().item()
         hits_sum = hits.sum(dim=0)
         for j, k in enumerate(hit_positions):
@@ -216,7 +270,13 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
             filter_mask = torch.cat((heads_filter, tails_filter)).to(device)
             pred_ents[filter_mask] = pred_ents.min() - 1.0
 
-            reciprocals, hits = utils.get_metrics(pred_ents, true_ents, k_values)
+            reciprocals, hits, ranks = utils.get_metrics(pred_ents, true_ents, k_values)
+            ranks = torch.reshape(ranks, (2, -1))  # split head and tail ranks
+
+            # typecase just to be sure
+            triple_ranks_filtered = torch.cat((t, ranks[0].unsqueeze(1).cpu(), ranks[1].unsqueeze(1).cpu()), dim=1).type(torch.int32)
+            triple_ranks_filtered_all.append(triple_ranks_filtered)
+
             mrr_filt += reciprocals.sum().item()
             hits_sum = hits.sum(dim=0)
             for j, k in enumerate(hit_positions):
@@ -250,16 +310,27 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
     mrr = mrr / num_predictions
     mrr_filt = mrr_filt / num_predictions
 
+    triple_ranks_all = torch.cat(triple_ranks_all, dim=0)
+
+    scores['mr'] = triple_ranks_all[:, 3:].float().mean().item()
+
     log_str = f'{prefix} mrr: {mrr:.4f}  '
     _run.log_scalar(f'{prefix}_mrr', mrr, epoch)
     for k, value in hits_at_k.items():
+        scores[f'hits@{k}'] = value
         log_str += f'hits@{k}: {value:.4f}  '
         _run.log_scalar(f'{prefix}_hits@{k}', value, epoch)
 
+    scores['mrr'] = mrr
     if compute_filtered:
+        triple_ranks_filtered_all = torch.cat(triple_ranks_filtered_all, dim=0)
         log_str += f'mrr_filt: {mrr_filt:.4f}  '
+        scores['mrr_filt'] = mrr_filt
+        scores['mr_filt'] = triple_ranks_filtered_all[:, 3:].float().mean().item()
+        print('mr_filt:', scores['mr_filt'])
         _run.log_scalar(f'{prefix}_mrr_filt', mrr_filt, epoch)
         for k, value in hits_at_k_filt.items():
+            scores[f'hits@{k}_filt'] = value
             log_str += f'hits@{k}_filt: {value:.4f}  '
             _run.log_scalar(f'{prefix}_hits@{k}_filt', value, epoch)
 
@@ -277,6 +348,7 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
             _run.log_scalar(t, value, epoch)
         _log.info(log_str)
 
+
     if compute_filtered and triples_loader.dataset.has_rel_categories:
         mrr_cat_count[mrr_cat_count < 1.0] = 1.0
         mrr_by_category = mrr_by_category / mrr_cat_count
@@ -288,9 +360,14 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
             _log.info(log_str)
 
     if return_embeddings:
-        out = (mrr, ent_emb)
+        out = (scores, ent_emb)
     else:
-        out = (mrr, None)
+        out = (scores, None)
+
+    print(scores)
+
+    if prefix == 'test':
+        torch.save(triple_ranks_filtered_all, osp.join(OUT_PATH, f'triple_ranks_all-{datetime.now().strftime("%Y-%m-%d-%H-%M")}.pt'))
 
     return out
 
@@ -426,20 +503,28 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
 
         # --- start: added for debugging
         #_log.info('Evaluating on validation set')
-        #val_mrr, _ = eval_link_prediction(model, valid_loader, train_data,
+        #val_scores, _ = eval_link_prediction(model, valid_loader, train_data,
         #                                  train_val_ent, epoch,
         #                                  emb_batch_size, prefix='valid',
         #                                  neighborhood_enrichment=neighborhood_enrichment,
         #                                  fusion_method=fusion_method)
 
         #_log.info('Evaluating on test set')
-        #_, ent_emb = eval_link_prediction(model, test_loader, train_data,
+        #val_scores, ent_emb = eval_link_prediction(model, test_loader, train_data,
         #                                  train_val_test_ent, max_epochs + 1,
         #                                  emb_batch_size, prefix='test',
         #                                  filtering_graph=graph,
         #                                  new_entities=test_new_ents,
         #                                  return_embeddings=True,
         #                                  neighborhood_enrichment=neighborhood_enrichment)
+
+        #print('logging to wandb')
+        #log_data = {"loss": train_loss / len(train_loader)}
+        #for k in ['mrr', 'hits@1', 'hits@3', 'hits@10', 'mr']:
+        #    if k in val_scores:
+        #        log_data[k] = val_scores[k]
+        #wandb.log(log_data, step=epoch)
+        #print('log_data', log_data)
         # --- end: added for debugging
 
         for step, data in enumerate(train_loader):
@@ -467,15 +552,21 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                  max_num_batches=len(valid_loader), neighborhood_enrichment=neighborhood_enrichment, fusion_method=fusion_method)
 
         _log.info('Evaluating on validation set')
-        val_mrr, _ = eval_link_prediction(model, valid_loader, train_data,
+        val_scores, _ = eval_link_prediction(model, valid_loader, train_data,
                                           train_val_ent, epoch,
                                           emb_batch_size, prefix='valid', neighborhood_enrichment=neighborhood_enrichment, fusion_method=fusion_method)
         if wandb_logging:
-            wandb.log({"val_mrr": val_mrr, "loss": train_loss / len(train_loader)})
+            print('logging to wandb')
+            log_data = {"loss": train_loss / len(train_loader)}
+            for k in ['mrr', 'hits@1', 'hits@3', 'hits@10', 'mr']:
+                if k in val_scores:
+                    log_data[f'val_{k}'] = val_scores[k]
+            wandb.log(log_data, step=epoch)
+
 
         # Keep checkpoint of best performing model (based on raw MRR)
-        if val_mrr > best_valid_mrr:
-            best_valid_mrr = val_mrr
+        if val_scores['mrr'] > best_valid_mrr:
+            best_valid_mrr = val_scores['mrr']
             torch.save(model.state_dict(), checkpoint_file)
 
     # Evaluate with best performing checkpoint

@@ -108,7 +108,7 @@ def get_metrics(pred_scores: torch.Tensor,
     reciprocals = average_rank.reciprocal()
     hits = average_rank <= k_values
 
-    return reciprocals, hits
+    return reciprocals, hits, average_rank
 
 
 def split_by_new_position(triples, mrr_values, new_entities):

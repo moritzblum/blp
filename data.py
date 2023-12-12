@@ -399,8 +399,20 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
             self.logger.info('Attention: Loading pre-computed neighborhood for debugging.')
             neighbor_tensor = torch.load(osp.join(self.directory, 'neighbors_tmp.pt'))
 
-        self.neighbors = neighbor_tensor[:, :self.num_neighbors]
 
+        #self.neighbors = neighbor_tensor[:, :self.num_neighbors]
+        self.neighbors = neighbor_tensor
+
+    def get_neighbors(self, ent_ids, dynamic_selection='random'):
+        """Get neighbors according to some dynamic selection strategy."""
+
+        if dynamic_selection == 'random':
+            neighbors = self.neighbors[ent_ids][ :, torch.randperm(10)[:self.num_neighbors]]
+        elif dynamic_selection == 'no':
+            neighbors = self.neighbors[:, :self.num_neighbors][ent_ids]
+        else:
+            raise ValueError('Unknown dynamic selection strategy:', dynamic_selection)
+        return neighbors
 
     def collate_fn(self, data_list):
         """Given a batch of triples, return it in the form of
@@ -415,8 +427,8 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         pos_pairs, rels = torch.stack(data_list).split(2, dim=1)
         text_tok, text_mask, text_len = self.get_entity_description(pos_pairs)
 
-        neighbors_head = self.neighbors[pos_pairs[:, 0]]
-        neighbors_tail = self.neighbors[pos_pairs[:, 1]]
+        neighbors_head = self.get_neighbors(pos_pairs[:, 0])
+        neighbors_tail = self.get_neighbors(pos_pairs[:, 1])
 
         text_tok_neighborhood_head, text_mask_neighborhood_head, _ = self.get_entity_description(
             neighbors_head)
