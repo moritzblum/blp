@@ -12,7 +12,9 @@ from tqdm import tqdm
 from nltk.corpus import stopwords
 import logging
 from torch_geometric.utils import k_hop_subgraph, subgraph, add_self_loops, to_undirected
-from transformers import BertTokenizer
+from transformers import BertTokenizer, BertModel
+import torch.nn as nn
+
 
 UNK = '[UNK]'
 nltk.download('stopwords')
@@ -115,8 +117,8 @@ class GraphDataset(Dataset):
             if not osp.exists(maps_path):
                 raise ValueError('Maps file not found.')
 
-            maps = torch.load(maps_path)
-            ent_ids, rel_ids = maps['ent_ids'], maps['rel_ids']
+            self.maps = torch.load(maps_path)
+            ent_ids, rel_ids = self.maps['ent_ids'], self.maps['rel_ids']
         else:
             ents_file = osp.join(directory, 'entities.txt')
             rels_file = osp.join(directory, 'relations.txt')
@@ -207,8 +209,8 @@ class TextGraphDataset(GraphDataset):
                          num_devices)
         self.logger = logging.getLogger()
 
-        maps = torch.load(self.maps_path)
-        ent_ids = maps['ent_ids']
+        self.maps = torch.load(self.maps_path)
+        ent_ids = self.maps['ent_ids']
 
         if max_len is None:
             max_len = tokenizer.max_len
@@ -288,12 +290,15 @@ class TextGraphDataset(GraphDataset):
         if isinstance(tokenizer, GloVeTokenizer):
             self.logger.info(f'Adding placeholder value for UNK token: {tokenizer.word2idx[UNK]}')
             placeholder[0][0] = tokenizer.word2idx[UNK]
+            self.unk_token_id = tokenizer.word2idx[UNK]
         elif isinstance(tokenizer, BertTokenizer):
             self.logger.info(f'Adding placeholder value for UNK token: {tokenizer.unk_token_id}')
             placeholder[0][0] = tokenizer.unk_token_id
+            self.unk_token_id = tokenizer.unk_token_id
 
         placeholder[0][max_len] = 1  # length 1
         self.text_data = torch.cat((self.text_data, placeholder), dim=0)
+
 
 
     def get_entity_description(self, ent_ids):
@@ -343,9 +348,34 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         self.num_neighbors = num_neighbors
         self.selection = selection
 
-        maps = torch.load(self.maps_path)
-        blp_ent_ids = maps['ent_ids']  # mapping: entity URI -> ID
-        blp_rel_ids = maps['rel_ids']
+        self.maps = torch.load(self.maps_path)
+        blp_ent_ids = self.maps['ent_ids']  # mapping: entity URI -> ID
+        blp_rel_ids = self.maps['rel_ids']
+
+        self.neighborhood_attention_model = None
+        # create relation + neighbor descriptions scorer
+
+
+        # load relation descriptions
+        file_path = osp.join(self.directory, 'relation2text.txt')
+        self.text_data_rel = torch.zeros((len(blp_rel_ids), max_len), dtype=torch.long)
+        with open(file_path) as f:
+            for line in f:
+                values = line.strip().split('\t')
+                relation = values[0]
+                text = ' '.join(values[1:])
+                if relation not in blp_rel_ids:
+                    continue
+                    # todo complete reading relation descriptions to dict
+
+                text_tokens = tokenizer.encode(text, max_length=max_len, return_tensors='pt')
+                self.text_data_rel[blp_rel_ids[relation], :text_tokens.shape[1]] = text_tokens
+
+        print('Text data shape:', self.text_data.size())
+        print('Relation descriptions shape:', self.text_data_rel.size())
+
+
+
 
         # as this class is just used for the training set, this list only contains train entity
         train_entities = self.entities
@@ -403,7 +433,7 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         #self.neighbors = neighbor_tensor[:, :self.num_neighbors]
         self.neighbors = neighbor_tensor
 
-    def get_neighbors(self, ent_ids, dynamic_selection='random'):
+    def get_neighbors(self, ent_ids, dynamic_selection='random', rels=None):
         """Get neighbors according to some dynamic selection strategy."""
 
         if dynamic_selection == 'random':
@@ -412,6 +442,33 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
             neighbors = self.neighbors[:, :self.num_neighbors][ent_ids]
         else:
             raise ValueError('Unknown dynamic selection strategy:', dynamic_selection)
+
+        batch_size = len(ent_ids)
+
+        neighbors = torch.full((batch_size, self.num_neighbors), -1, dtype=torch.long)
+        for i, rel_id in enumerate(rels):
+            text_tok_rel = self.text_data_rel[rel_id.item()]
+            text_tok_rel_batch = text_tok_rel.repeat(20, 1)
+
+            # todo refactor magic number 20 and 102
+            text_tok_ent, text_mask_ent, text_len_ent = self.get_entity_description(self.neighbors[ent_ids[i], :20])
+
+            rel_neigh_tok = torch.cat([text_tok_rel_batch,
+                                     torch.full((text_tok_rel_batch.size(0), 1), 102),
+                                     text_tok_ent], dim=1)
+
+            rel_neigh_tok_mask = (rel_neigh_tok > 0).float()
+
+            x = self.neighborhood_attention_model._score_neigh_att(rel_neigh_tok.to(self.device), rel_neigh_tok_mask.to(self.device)).flatten()
+
+            indices_ = torch.argsort(x, descending=True)
+            neighbors_sorted = torch.gather(self.neighbors[ent_ids[i]], 0, indices_.cpu())
+
+            # filter out -1 padding values and cut off after num_neighbors
+            neighbors_sorted = neighbors_sorted[neighbors_sorted != -1][:self.num_neighbors]
+
+            neighbors[i][:neighbors_sorted.size(0)] = neighbors_sorted
+
         return neighbors
 
     def collate_fn(self, data_list):
@@ -425,13 +482,15 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
                              ' larger than 1.')
 
         pos_pairs, rels = torch.stack(data_list).split(2, dim=1)
+
         text_tok, text_mask, text_len = self.get_entity_description(pos_pairs)
 
-        neighbors_head = self.get_neighbors(pos_pairs[:, 0])
-        neighbors_tail = self.get_neighbors(pos_pairs[:, 1])
+        neighbors_head = self.get_neighbors(pos_pairs[:, 0], rels=rels)
+        neighbors_tail = self.get_neighbors(pos_pairs[:, 1], rels=rels)
 
         text_tok_neighborhood_head, text_mask_neighborhood_head, _ = self.get_entity_description(
             neighbors_head)
+
         text_tok_neighborhood_tail, text_mask_neighborhood_tail, _ = self.get_entity_description(
             neighbors_tail)
 
@@ -445,9 +504,9 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
             print('Loading inductive page link graph.')
             self.page_link_graph = torch.load(processed_file_path)
         else:
-            maps = torch.load(self.maps_path)
-            ent_uri_2_id = maps['ent_ids']
-            rel_uri_2_id = maps['rel_ids']
+            self.maps = torch.load(self.maps_path)
+            ent_uri_2_id = self.maps['ent_ids']
+            rel_uri_2_id = self.maps['rel_ids']
 
             page_links_graph_raw = []
             skipped = 0

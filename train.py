@@ -167,7 +167,7 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
 
             if neighborhood_enrichment:
                 # todo change neighbor to get_neighbor function
-                neighbors = text_dataset.neighbors[batch_ents].view(-1, 2)
+                neighbors = text_dataset.get_neighbors(batch_ents).view(-1, 2)
 
                 # neighbors are split into two columns, one for head and one for tail in order to use the
                 # existing forward function
@@ -367,7 +367,9 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
     print(scores)
 
     if prefix == 'test':
-        torch.save(triple_ranks_filtered_all, osp.join(OUT_PATH, f'triple_ranks_all-{datetime.now().strftime("%Y-%m-%d-%H-%M")}.pt'))
+        ranks_file_name = f'triple_ranks_all-{datetime.now().strftime("%Y-%m-%d-%H-%M")}.pt'
+        print('saving triple ranks:', ranks_file_name)
+        torch.save(triple_ranks_filtered_all, osp.join(OUT_PATH, ranks_file_name))
 
     return out
 
@@ -481,11 +483,15 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
     model = utils.get_model(model, dim, rel_model, loss_fn,
                             len(train_val_test_ent), train_data.num_rels,
                             encoder_name, regularizer, num_neighbors, fusion_method, edge_features, weighted_pooling)
+
+    train_data.neighborhood_attention_model = model  # provide the data loader with the model for the neighborhood attention
+
     if checkpoint is not None:
         model.load_state_dict(torch.load(checkpoint, map_location='cpu'))
 
     if device != torch.device('cpu'):
         model = torch.nn.DataParallel(model).to(device)
+
 
     optimizer = Adam(model.parameters(), lr=lr)
     total_steps = len(train_loader) * max_epochs
@@ -532,6 +538,11 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
 
             optimizer.zero_grad()
             loss.backward()
+
+            #for name, param in model.named_parameters():
+            #    if param.grad is not None:
+            #        print(f'Parameter {name} has gradients, so it has been updated.')
+
             optimizer.step()
             if use_scheduler:
                 scheduler.step()
@@ -545,29 +556,33 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
 
         _run.log_scalar('train_loss', train_loss / len(train_loader), epoch)
 
-        if dataset != 'Wikidata5M':
-            _log.info('Evaluating on sample of training set')
-            eval_link_prediction(model, train_eval_loader, train_data, train_ent,
-                                 epoch, emb_batch_size, prefix='train',
-                                 max_num_batches=len(valid_loader), neighborhood_enrichment=neighborhood_enrichment, fusion_method=fusion_method)
+        evaluate = False
+        if evaluate:
+            if dataset != 'Wikidata5M':
+                _log.info('Evaluating on sample of training set')
+                eval_link_prediction(model, train_eval_loader, train_data, train_ent,
+                                     epoch, emb_batch_size, prefix='train',
+                                     max_num_batches=len(valid_loader), neighborhood_enrichment=neighborhood_enrichment, fusion_method=fusion_method)
 
-        _log.info('Evaluating on validation set')
-        val_scores, _ = eval_link_prediction(model, valid_loader, train_data,
-                                          train_val_ent, epoch,
-                                          emb_batch_size, prefix='valid', neighborhood_enrichment=neighborhood_enrichment, fusion_method=fusion_method)
+            _log.info('Evaluating on validation set')
+            val_scores, _ = eval_link_prediction(model, valid_loader, train_data,
+                                              train_val_ent, epoch,
+                                              emb_batch_size, prefix='valid', neighborhood_enrichment=neighborhood_enrichment, fusion_method=fusion_method)
+
+            # Keep checkpoint of best performing model (based on raw MRR)
+            if val_scores['mrr'] > best_valid_mrr:
+                best_valid_mrr = val_scores['mrr']
+                torch.save(model.state_dict(), checkpoint_file)
+
         if wandb_logging:
             print('logging to wandb')
             log_data = {"loss": train_loss / len(train_loader)}
-            for k in ['mrr', 'hits@1', 'hits@3', 'hits@10', 'mr']:
-                if k in val_scores:
-                    log_data[f'val_{k}'] = val_scores[k]
+            if evaluate:
+                for k in ['mrr', 'hits@1', 'hits@3', 'hits@10', 'mr']:
+                    if k in val_scores:
+                        log_data[f'val_{k}'] = val_scores[k]
             wandb.log(log_data, step=epoch)
 
-
-        # Keep checkpoint of best performing model (based on raw MRR)
-        if val_scores['mrr'] > best_valid_mrr:
-            best_valid_mrr = val_scores['mrr']
-            torch.save(model.state_dict(), checkpoint_file)
 
     # Evaluate with best performing checkpoint
     if max_epochs > 0:

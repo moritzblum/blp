@@ -7,6 +7,9 @@ from transformers import BertModel
 import logging
 
 
+
+
+
 class Gate(nn.Module):
 
     def __init__(self,
@@ -65,6 +68,8 @@ class LinkPrediction(nn.Module):
         self.weighted_pooling = weighted_pooling
         self.edge_features = edge_features
         self.logger = logging.getLogger()
+        # todo take neighborhood selection transformer as init parameter and add it here to the model as attribute
+
 
 
 
@@ -309,11 +314,26 @@ class BertEmbeddingsLP(InductiveLinkPrediction):
         hidden_size = self.encoder.config.hidden_size
         self.enc_linear = nn.Linear(hidden_size, self.dim, bias=False)
 
+
+        self.encoder_neigh_att = BertModel.from_pretrained(encoder_name,
+                                                 # works as encoder_name == tokenizer_name
+                                                 output_attentions=False,
+                                                 output_hidden_states=False)
+
+        self.enc_neigh_att_linear = nn.Linear(self.encoder_neigh_att.config.hidden_size, 1)
+
+
     def _encode_entity(self, text_tok, text_mask):
         # Extract BERT representation of [CLS] token
         embs = self.encoder(text_tok, text_mask)[0][:, 0]
         embs = self.enc_linear(embs)
         return embs
+
+    def _score_neigh_att(self, text_tok, text_mask):
+        x = self.encoder_neigh_att(text_tok, text_mask)[0][:, 0]
+        x = self.enc_neigh_att_linear(x)
+        x = torch.sigmoid(x)
+        return x
 
 
 class WordEmbeddingsLP(InductiveLinkPrediction):
