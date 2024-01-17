@@ -12,6 +12,7 @@ from sacred.run import Run
 from logging import Logger
 from sacred import Experiment
 from sacred.observers import MongoObserver
+from tqdm import tqdm
 from transformers import BertTokenizer, get_linear_schedule_with_warmup
 from collections import defaultdict
 import numpy as np
@@ -25,6 +26,8 @@ import models
 import utils
 import wandb
 
+from models import NeighborhoodSelectionTransformer
+
 OUT_PATH = 'output/'
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -36,13 +39,13 @@ database = os.environ.get('DB_NAME')
 if all([uri, database]):
     ex.observers.append(MongoObserver(uri, database))
 
-
-
 """
 env (GPU Cluster): lp
 
 best performing model so far: 
 slurm_blp-fb15k237_transe_bert.sh
+python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint=None checkpoint_neigh=None use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' wandb_logging=True
+python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint="./output/test_1.pt" checkpoint_neigh="./output/test_2.pt" use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' wandb_logging=True
 
 python train.py link_prediction with \
 dataset='FB15k-237' \
@@ -62,6 +65,7 @@ emb_batch_size=512 \
 eval_batch_size=64 \
 max_epochs=40 \
 checkpoint=None \
+checkpoint_neigh=None \
 use_cached_text=True \
 use_cached_neighbors=True \
 neighborhood_enrichment=True \
@@ -92,6 +96,7 @@ def config():
     eval_batch_size = 64
     max_epochs = 40
     checkpoint = None
+    checkpoint_neigh = None
     use_cached_text = False
     use_cached_neighbors = False
     neighborhood_enrichment = False
@@ -103,6 +108,239 @@ def config():
     # logging
     wandb_logging = False
     edge_features = False
+
+
+@ex.capture
+@torch.no_grad()
+def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, entities,
+                                         _run: Run, _log: Logger,
+                                         prefix='', max_num_batches=None,
+                                         filtering_graph=None, new_entities=None,
+                                         return_embeddings=False,
+                                         neighborhood_selector=None,
+                                         emb_dim=128, epoch=0):
+    _log.info('Starting evaluation with neighborhood attention')
+    num_entities = entities.shape[0]
+    num_relations = model.module.num_relations
+
+    compute_filtered = True
+
+    if compute_filtered:
+        max_ent_id = max(filtering_graph.nodes)
+    else:
+        max_ent_id = entities.max()
+
+
+    # todo remove after debugging
+    if os.path.exists(osp.join('./output', 'test_ent_emb.pt')):
+        print('loading embeddings')
+        ent_emb = torch.load(osp.join('./output', 'test_ent_emb.pt'))
+        ent2idx = torch.load(osp.join('./output', 'test_ent2idx.pt'))
+    else:
+        ent2idx = torch.full(max_ent_id + 1, fill_value=-1, dtype=torch.long)
+        ent_emb = torch.rand((num_entities, num_relations, emb_dim))
+
+        rels = torch.arange(num_relations)
+
+        for ent_idx, ent_id in enumerate(tqdm(entities.tolist())):
+            ent2idx[ent_id] = ent_idx
+
+            batch_ents = torch.full([num_relations], fill_value=ent_id)
+            text_tok, text_mask, _ = text_dataset.get_entity_description(batch_ents)
+            text_len = text_tok.size(1)
+
+            neighbors = neighborhood_selector(batch_ents, rels=rels, neigh_selection='attention')
+            text_tok_neighbors, text_mask_neighbors, _ = text_dataset.get_entity_description(neighbors)
+
+            batch_emb_id = model(text_tok=text_tok.reshape((-1, text_len)).to(device),
+                                 text_mask=text_mask.reshape((-1, text_len)).to(device),
+                                 text_tok_neighborhood_all=text_tok_neighbors)
+
+            ent_emb[ent_idx] = batch_emb_id
+
+        torch.save(ent_emb, osp.join('./output', 'test_ent_emb.pt'))
+        torch.save(ent2idx, osp.join('./output', 'test_ent2idx.pt'))
+
+    # evaluation code
+    scores = {}
+
+
+    mrr_by_position = torch.zeros(3, dtype=torch.float).to(device)
+    mrr_pos_counts = torch.zeros_like(mrr_by_position)
+
+    rel_categories = triples_loader.dataset.rel_categories.to(device)
+    mrr_by_category = torch.zeros([2, 4], dtype=torch.float).to(device)
+    mrr_cat_count = torch.zeros([1, 4], dtype=torch.float).to(device)
+
+    hit_positions = [1, 3, 10]
+    k_values = torch.tensor([hit_positions], device=device)
+    hits_at_k = {pos: 0.0 for pos in hit_positions}
+    mrr = 0.0
+    mrr_filt = 0.0
+    hits_at_k_filt = {pos: 0.0 for pos in hit_positions}
+
+    if device != torch.device('cpu'):
+        model = model.module
+
+    num_predictions = 0
+    _log.info('Computing metrics on set of triples')
+    total = len(triples_loader) if max_num_batches is None else max_num_batches
+
+    triple_ranks_all = []
+    triple_ranks_filtered_all = []
+    for i, triples in enumerate(triples_loader):
+
+        if max_num_batches is not None and i == max_num_batches:
+            break
+
+        heads, tails, rels = torch.chunk(triples, chunks=3, dim=1)
+        t = torch.cat((heads, rels, tails), dim=1)
+
+        # Map entity IDs to positions in ent_emb
+        heads = ent2idx[heads.flatten()]
+        tails = ent2idx[tails.flatten()]
+
+        assert heads.min() >= 0
+        assert tails.min() >= 0
+
+        # Embed triples
+        # shape: batch size x emb_dim
+        # todo error potentially here
+        head_embs = ent_emb[heads, rels.flatten()]
+        tail_embs = ent_emb[tails, rels.flatten()]
+
+        # Score all possible heads and tails
+        ent_emb_new = []
+        for r in tqdm(rels.flatten()):
+            ent_emb_new.append(ent_emb[:, r])
+
+        # batch size x num entities x embedding dim
+        ent_emb_new = torch.stack(ent_emb_new).to(device)
+        tail_embs = tail_embs.unsqueeze(1).repeat((1, ent_emb_new.size(1), 1)).to(device)
+        head_embs = head_embs.unsqueeze(1).repeat((1, ent_emb_new.size(1), 1)).to(device)
+        rel_embs = model.rel_emb(rels.flatten().repeat(ent_emb_new.size(1), 1).T.to(device))
+
+        # todo check if this is done on GPU
+        heads_predictions = model.score_fn(ent_emb_new, tail_embs, rel_embs, eval=True)
+        tails_predictions = model.score_fn(head_embs, ent_emb_new, rel_embs, eval=True)
+
+        pred_ents = torch.cat((heads_predictions, tails_predictions))
+
+        # todo indexing of true_ents is wrong -> might not be neccessary to fix as we are only interested in the filtered setting
+        # todo check dimensions
+        true_ents = torch.cat((heads.flatten().unsqueeze(1),
+                               tails.flatten().unsqueeze(1))).to(device)
+
+        num_predictions += pred_ents.shape[0]
+        reciprocals, hits, ranks = utils.get_metrics(pred_ents, true_ents, k_values)
+        mrr += reciprocals.sum().item()
+        hits_sum = hits.sum(dim=0)
+
+        for j, k in enumerate(hit_positions):
+            hits_at_k[k] += hits_sum[j].item()
+
+        if compute_filtered:
+            filters = utils.get_triple_filters(triples, filtering_graph, num_entities, ent2idx)
+            heads_filter, tails_filter = filters
+            # Filter entities by assigning them the lowest score in the batch
+            filter_mask = torch.cat((heads_filter, tails_filter)).to(device)
+            pred_ents[filter_mask] = pred_ents.min() - 1.0
+
+            reciprocals, hits, ranks = utils.get_metrics(pred_ents, true_ents, k_values)
+            ranks = torch.reshape(ranks, (2, -1))  # split head and tail ranks
+
+            # typecase just to be sure
+            triple_ranks_filtered = torch.cat(
+                (t, ranks[0].unsqueeze(1).cpu(), ranks[1].unsqueeze(1).cpu()), dim=1).type(torch.int32)
+
+            print('triple_ranks_filtered', triple_ranks_filtered)
+            triple_ranks_filtered_all.append(triple_ranks_filtered)
+
+            mrr_filt += reciprocals.sum().item()
+            hits_sum = hits.sum(dim=0)
+            for j, k in enumerate(hit_positions):
+                hits_at_k_filt[k] += hits_sum[j].item()
+
+            reciprocals = reciprocals.squeeze()
+            if new_entities is not None:
+                by_position = utils.split_by_new_position(triples,
+                                                          reciprocals,
+                                                          new_entities)
+                batch_mrr_by_position, batch_mrr_pos_counts = by_position
+                mrr_by_position += batch_mrr_by_position
+                mrr_pos_counts += batch_mrr_pos_counts
+
+            if triples_loader.dataset.has_rel_categories:
+                by_category = utils.split_by_category(triples,
+                                                      reciprocals,
+                                                      rel_categories)
+                batch_mrr_by_cat, batch_mrr_cat_count = by_category
+                mrr_by_category += batch_mrr_by_cat
+                mrr_cat_count += batch_mrr_cat_count
+
+        if (i + 1) % int(0.2 * total) == 0:
+            _log.info(f'[{i + 1:,}/{total:,}]')
+
+    _log.info(f'The total number of predictions is {num_predictions:,}')
+    for hits_dict in (hits_at_k, hits_at_k_filt):
+        for k in hits_dict:
+            hits_dict[k] /= num_predictions
+
+    mrr = mrr / num_predictions
+    mrr_filt = mrr_filt / num_predictions
+
+    log_str = f'{prefix} mrr: {mrr:.4f}  '
+    _run.log_scalar(f'{prefix}_mrr', mrr, epoch)
+    for k, value in hits_at_k.items():
+        scores[f'hits@{k}'] = value
+        log_str += f'hits@{k}: {value:.4f}  '
+        _run.log_scalar(f'{prefix}_hits@{k}', value, epoch)
+
+    scores['mrr'] = mrr
+    if compute_filtered:
+        triple_ranks_filtered_all = torch.cat(triple_ranks_filtered_all, dim=0)
+        log_str += f'mrr_filt: {mrr_filt:.4f}  '
+        scores['mrr_filt'] = mrr_filt
+        scores['mr_filt'] = triple_ranks_filtered_all[:, 3:].float().mean().item()
+        print('mr_filt:', scores['mr_filt'])
+        _run.log_scalar(f'{prefix}_mrr_filt', mrr_filt, epoch)
+        for k, value in hits_at_k_filt.items():
+            scores[f'hits@{k}_filt'] = value
+            log_str += f'hits@{k}_filt: {value:.4f}  '
+            _run.log_scalar(f'{prefix}_hits@{k}_filt', value, epoch)
+
+    _log.info(log_str)
+
+    if new_entities is not None and compute_filtered:
+        mrr_pos_counts[mrr_pos_counts < 1.0] = 1.0
+        mrr_by_position = mrr_by_position / mrr_pos_counts
+        log_str = ''
+        for i, t in enumerate((f'{prefix}_mrr_filt_both_new',
+                               f'{prefix}_mrr_filt_head_new',
+                               f'{prefix}_mrr_filt_tail_new')):
+            value = mrr_by_position[i].item()
+            log_str += f'{t}: {value:.4f}  '
+            _run.log_scalar(t, value, epoch)
+        _log.info(log_str)
+
+    if compute_filtered and triples_loader.dataset.has_rel_categories:
+        mrr_cat_count[mrr_cat_count < 1.0] = 1.0
+        mrr_by_category = mrr_by_category / mrr_cat_count
+
+        for i, case in enumerate(['pred_head', 'pred_tail']):
+            log_str = f'{case} '
+            for cat, cat_id in CATEGORY_IDS.items():
+                log_str += f'{cat}_mrr: {mrr_by_category[i, cat_id]:.4f}  '
+            _log.info(log_str)
+
+    if return_embeddings:
+        out = (scores, ent_emb)
+    else:
+        out = (scores, None)
+
+    print(scores)
+
+    return out
 
 
 @ex.capture
@@ -166,7 +404,6 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
             text_tok, text_mask, text_len = text_dataset.get_entity_description(batch_ents)
 
             if neighborhood_enrichment:
-                # todo change neighbor to get_neighbor function
                 neighbors = text_dataset.get_neighbors(batch_ents).view(-1, 2)
 
                 # neighbors are split into two columns, one for head and one for tail in order to use the
@@ -178,10 +415,14 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
 
                 batch_emb = model(text_tok=text_tok.reshape((-1, 2, text_dataset.max_len)).to(device),
                                   text_mask=text_mask.reshape((-1, 2, 32)).to(device),
-                                  text_tok_neighborhood_head=text_tok_neighbors_head.reshape((-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device),
-                                  text_mask_neighborhood_head=text_mask_neighbors_head.reshape((-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device),
-                                  text_tok_neighborhood_tail=text_tok_neighbors_tail.reshape((-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device),
-                                  text_mask_neighborhood_tail=text_mask_neighbors_tail.reshape((-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device))
+                                  text_tok_neighborhood_head=text_tok_neighbors_head.reshape(
+                                      (-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device),
+                                  text_mask_neighborhood_head=text_mask_neighbors_head.reshape(
+                                      (-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device),
+                                  text_tok_neighborhood_tail=text_tok_neighbors_tail.reshape(
+                                      (-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device),
+                                  text_mask_neighborhood_tail=text_mask_neighbors_tail.reshape(
+                                      (-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device))
 
             else:
                 batch_emb = model(text_tok=text_tok.unsqueeze(1).to(device),
@@ -191,7 +432,7 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
             if padding:
                 batch_emb = batch_emb[:-1]
 
-            #print('----')
+            # print('----')
 
         else:
             # Encode from lookup table
@@ -215,7 +456,7 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
     triple_ranks_filtered_all = []
     for i, triples in enumerate(triples_loader):
         # todo remove after debugging
-        #if i == 2:
+        # if i == 2:
         #    break
 
         if max_num_batches is not None and i == max_num_batches:
@@ -239,9 +480,9 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
 
         # Score all possible heads and tails
         ent_emb_new = ent_emb.repeat((tail_embs.size(0), 1, 1))
-        tail_embs = tail_embs.repeat((1, ent_emb.size(1),1))
-        head_embs = head_embs.repeat((1, ent_emb.size(1),1))
-        rel_embs = rel_embs.repeat((1, ent_emb.size(1),1))
+        tail_embs = tail_embs.repeat((1, ent_emb.size(1), 1))
+        head_embs = head_embs.repeat((1, ent_emb.size(1), 1))
+        rel_embs = rel_embs.repeat((1, ent_emb.size(1), 1))
 
         heads_predictions = model.score_fn(ent_emb_new, tail_embs, rel_embs, eval=True)
         tails_predictions = model.score_fn(head_embs, ent_emb_new, rel_embs, eval=True)
@@ -254,7 +495,7 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
         ranks = torch.reshape(ranks, (2, -1))
 
         triple_ranks = torch.cat((t, ranks[0].unsqueeze(1).cpu(), ranks[1].unsqueeze(1).cpu()),
-                                          dim=1).type(torch.int32)
+                                 dim=1).type(torch.int32)
         triple_ranks_all.append(triple_ranks)
 
         mrr += reciprocals.sum().item()
@@ -274,7 +515,8 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
             ranks = torch.reshape(ranks, (2, -1))  # split head and tail ranks
 
             # typecase just to be sure
-            triple_ranks_filtered = torch.cat((t, ranks[0].unsqueeze(1).cpu(), ranks[1].unsqueeze(1).cpu()), dim=1).type(torch.int32)
+            triple_ranks_filtered = torch.cat(
+                (t, ranks[0].unsqueeze(1).cpu(), ranks[1].unsqueeze(1).cpu()), dim=1).type(torch.int32)
             triple_ranks_filtered_all.append(triple_ranks_filtered)
 
             mrr_filt += reciprocals.sum().item()
@@ -348,7 +590,6 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
             _run.log_scalar(t, value, epoch)
         _log.info(log_str)
 
-
     if compute_filtered and triples_loader.dataset.has_rel_categories:
         mrr_cat_count[mrr_cat_count < 1.0] = 1.0
         mrr_by_category = mrr_by_category / mrr_cat_count
@@ -378,13 +619,16 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
 def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                     encoder_name, regularizer, max_len, num_negatives, lr,
                     use_scheduler, batch_size, emb_batch_size, eval_batch_size,
-                    max_epochs, checkpoint, use_cached_text, use_cached_neighbors,
-                    neighborhood_enrichment, num_neighbors, edge_features, fusion_method,  weighted_pooling, neighborhood_selection, wandb_logging,
+                    max_epochs, checkpoint, checkpoint_neigh, use_cached_text, use_cached_neighbors,
+                    neighborhood_enrichment, num_neighbors, edge_features, fusion_method,
+                    weighted_pooling, neighborhood_selection, wandb_logging,
                     _run: Run, _log: Logger):
-
     _log.info(f'config: {_run.config}')
 
-    if wandb_logging:
+    if checkpoint is not None:
+        _log.info(f'Evaluation. Checkpoint: {checkpoint}, {checkpoint_neigh}')
+
+    if wandb_logging and checkpoint is None:
         wandb.login()
         wandb.init(
             # Set the project where this run will be logged
@@ -423,15 +667,15 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
         if neighborhood_enrichment:
             print('neighborhood_enrichment:', neighborhood_enrichment)
             train_data = NeighborhoodTextGraphDataset(triples_file, num_negatives,
-                                          max_len, tokenizer, drop_stopwords,
-                                          num_neighbors=num_neighbors,
-                                          selection=neighborhood_selection,
-                                          write_maps_file=True,
-                                          use_cached_text=use_cached_text,
-                                          use_cached_neighbors=use_cached_neighbors,
-                                          num_devices=num_devices,
-                                          device=device,
-                                          tokenizer_name=tokenizer_name)
+                                                      max_len, tokenizer, drop_stopwords,
+                                                      num_neighbors=num_neighbors,
+                                                      selection=neighborhood_selection,
+                                                      write_maps_file=True,
+                                                      use_cached_text=use_cached_text,
+                                                      use_cached_neighbors=use_cached_neighbors,
+                                                      num_devices=num_devices,
+                                                      device=device,
+                                                      tokenizer_name=tokenizer_name)
         else:
             train_data = TextGraphDataset(triples_file, num_negatives,
                                           max_len, tokenizer, drop_stopwords,
@@ -482,141 +726,181 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
 
     model = utils.get_model(model, dim, rel_model, loss_fn,
                             len(train_val_test_ent), train_data.num_rels,
-                            encoder_name, regularizer, num_neighbors, fusion_method, edge_features, weighted_pooling)
+                            encoder_name, regularizer, num_neighbors, fusion_method, edge_features,
+                            weighted_pooling)
 
-    train_data.neighborhood_attention_model = model  # provide the data loader with the model for the neighborhood attention
+    model_neigh_sel = NeighborhoodSelectionTransformer(encoder_name=encoder_name)
 
     if checkpoint is not None:
-        model.load_state_dict(torch.load(checkpoint, map_location='cpu'))
+        _log.info(f'Loading model from checkpoint: {checkpoint}, {checkpoint_neigh}')
+        # model.load_state_dict(torch.load(checkpoint, map_location='cpu'))
+        model_neigh_sel.load_state_dict(torch.load(checkpoint_neigh, map_location='cpu'))
+        _log.info('Models loaded')
 
     if device != torch.device('cpu'):
         model = torch.nn.DataParallel(model).to(device)
+        model_neigh_sel = torch.nn.DataParallel(model_neigh_sel).to(device)
 
+    # provide the data loader with the model for the neighborhood attention
+    train_data.neighborhood_attention_model = model_neigh_sel
 
-    optimizer = Adam(model.parameters(), lr=lr)
-    total_steps = len(train_loader) * max_epochs
-    if use_scheduler:
-        warmup = int(0.2 * total_steps)
-        scheduler = get_linear_schedule_with_warmup(optimizer,
-                                                    num_warmup_steps=warmup,
-                                                    num_training_steps=total_steps)
-    best_valid_mrr = 0.0
+    if checkpoint is None:
+        _log.info('Start model training')
+        optimizer = Adam(list(model.parameters()) + list(model_neigh_sel.parameters()), lr=lr)
+        total_steps = len(train_loader) * max_epochs
+        if use_scheduler:
+            warmup = int(0.2 * total_steps)
+            scheduler = get_linear_schedule_with_warmup(optimizer,
+                                                        num_warmup_steps=warmup,
+                                                        num_training_steps=total_steps)
+        best_valid_mrr = 0.0
 
-    checkpoint_file = osp.join(OUT_PATH, f'model-{encoder_name}-{datetime.now().strftime("%Y-%m-%d-%H-%M")}-{"".join([random.choice(string.ascii_lowercase) for _ in range(6)])}.pt')
-    _log.info(f'checkpoint_file: {checkpoint_file}')
-    for epoch in range(1, max_epochs + 1):
-        train_loss = 0
+        checkpoint_file = osp.join(OUT_PATH,
+                                   f'model-{encoder_name}-{datetime.now().strftime("%Y-%m-%d-%H-%M")}-{"".join([random.choice(string.ascii_lowercase) for _ in range(6)])}')
+        _log.info(f'checkpoint_file: {checkpoint_file} + .pt/_neigh_sel.pt')
+        # todo add time per batch estimation to logging
+        for epoch in range(1, max_epochs + 1):
+            train_loss = 0
 
-        # --- start: added for debugging
-        #_log.info('Evaluating on validation set')
-        #val_scores, _ = eval_link_prediction(model, valid_loader, train_data,
-        #                                  train_val_ent, epoch,
-        #                                  emb_batch_size, prefix='valid',
-        #                                  neighborhood_enrichment=neighborhood_enrichment,
-        #                                  fusion_method=fusion_method)
+            # todo uncomment for evaluation during training
+            # --- start: added for debugging
+            # _log.info('Evaluating on validation set')
 
-        #_log.info('Evaluating on test set')
-        #val_scores, ent_emb = eval_link_prediction(model, test_loader, train_data,
-        #                                  train_val_test_ent, max_epochs + 1,
-        #                                  emb_batch_size, prefix='test',
-        #                                  filtering_graph=graph,
-        #                                  new_entities=test_new_ents,
-        #                                  return_embeddings=True,
-        #                                  neighborhood_enrichment=neighborhood_enrichment)
+            # new for neighborhood attention
+            # eval_link_prediction_neigh_attention(model, valid_loader, train_data,
+            #                                     train_val_ent, epoch,
+            #                                     emb_batch_size, prefix='valid',
+            #                                  neighborhood_enrichment=True,
+            #                                  neighborhood_selector=train_data.get_neighbors,
+            #                                    emb_dim=dim)
 
-        #print('logging to wandb')
-        #log_data = {"loss": train_loss / len(train_loader)}
-        #for k in ['mrr', 'hits@1', 'hits@3', 'hits@10', 'mr']:
-        #    if k in val_scores:
-        #        log_data[k] = val_scores[k]
-        #wandb.log(log_data, step=epoch)
-        #print('log_data', log_data)
-        # --- end: added for debugging
+            # val_scores, _ = eval_link_prediction(model, valid_loader, train_data,
+            #                                  train_val_ent, epoch,
+            #                                  emb_batch_size, prefix='valid',
+            #                                  neighborhood_enrichment=neighborhood_enrichment,
+            #                                  fusion_method=fusion_method)
 
-        for step, data in enumerate(train_loader):
-            loss = model(*data).mean()
+            # _log.info('Evaluating on test set')
+            # val_scores, ent_emb = eval_link_prediction(model, test_loader, train_data,
+            #                                  train_val_test_ent, max_epochs + 1,
+            #                                  emb_batch_size, prefix='test',
+            #                                  filtering_graph=graph,
+            #                                  new_entities=test_new_ents,
+            #                                  return_embeddings=True,
+            #                                  neighborhood_enrichment=neighborhood_enrichment)
 
-            optimizer.zero_grad()
-            loss.backward()
+            # print('logging to wandb')
+            # log_data = {"loss": train_loss / len(train_loader)}
+            # for k in ['mrr', 'hits@1', 'hits@3', 'hits@10', 'mr']:
+            #    if k in val_scores:
+            #        log_data[k] = val_scores[k]
+            # wandb.log(log_data, step=epoch)
+            # print('log_data', log_data)
+            # --- end: added for debugging
 
-            #for name, param in model.named_parameters():
-            #    if param.grad is not None:
-            #        print(f'Parameter {name} has gradients, so it has been updated.')
+            for step, data in enumerate(train_loader):
+                loss = model(*data).mean()
 
-            optimizer.step()
-            if use_scheduler:
-                scheduler.step()
+                optimizer.zero_grad()
+                loss.backward()
 
-            train_loss += loss.item()
+                # for name, param in model_neigh_sel.named_parameters():
+                #    if param.grad is not None:
+                #        print(f'Parameter {name} has gradients, so it has been updated.')
 
-            if step % int(0.05 * len(train_loader)) == 0:
-                _log.info(f'Epoch {epoch}/{max_epochs} '
-                          f'[{step}/{len(train_loader)}]: {loss.item():.6f}')
-                _run.log_scalar('batch_loss', loss.item())
+                optimizer.step()
+                if use_scheduler:
+                    scheduler.step()
 
-        _run.log_scalar('train_loss', train_loss / len(train_loader), epoch)
+                train_loss += loss.item()
 
-        evaluate = False
-        if evaluate:
-            if dataset != 'Wikidata5M':
-                _log.info('Evaluating on sample of training set')
-                eval_link_prediction(model, train_eval_loader, train_data, train_ent,
-                                     epoch, emb_batch_size, prefix='train',
-                                     max_num_batches=len(valid_loader), neighborhood_enrichment=neighborhood_enrichment, fusion_method=fusion_method)
+                if step % int(0.05 * len(train_loader)) == 0:
+                    _log.info(f'Epoch {epoch}/{max_epochs} '
+                              f'[{step}/{len(train_loader)}]: {loss.item():.6f}')
+                    _run.log_scalar('batch_loss', loss.item())
 
-            _log.info('Evaluating on validation set')
-            val_scores, _ = eval_link_prediction(model, valid_loader, train_data,
-                                              train_val_ent, epoch,
-                                              emb_batch_size, prefix='valid', neighborhood_enrichment=neighborhood_enrichment, fusion_method=fusion_method)
+            _run.log_scalar('train_loss', train_loss / len(train_loader), epoch)
 
-            # Keep checkpoint of best performing model (based on raw MRR)
-            if val_scores['mrr'] > best_valid_mrr:
-                best_valid_mrr = val_scores['mrr']
-                torch.save(model.state_dict(), checkpoint_file)
-
-        if wandb_logging:
-            print('logging to wandb')
-            log_data = {"loss": train_loss / len(train_loader)}
+            # todo currently no evaluation during training. Reactivate if evaluation time is reasonable.
+            evaluate = False
             if evaluate:
-                for k in ['mrr', 'hits@1', 'hits@3', 'hits@10', 'mr']:
-                    if k in val_scores:
-                        log_data[f'val_{k}'] = val_scores[k]
-            wandb.log(log_data, step=epoch)
+                if dataset != 'Wikidata5M':
+                    _log.info('Evaluating on sample of training set')
+                    eval_link_prediction(model, train_eval_loader, train_data, train_ent,
+                                         epoch, emb_batch_size, prefix='train',
+                                         max_num_batches=len(valid_loader),
+                                         neighborhood_enrichment=neighborhood_enrichment,
+                                         fusion_method=fusion_method)
 
+                _log.info('Evaluating on validation set')
+                val_scores, _ = eval_link_prediction(model, valid_loader, train_data,
+                                                     train_val_ent, epoch,
+                                                     emb_batch_size, prefix='valid',
+                                                     neighborhood_enrichment=neighborhood_enrichment,
+                                                     fusion_method=fusion_method)
 
-    # Evaluate with best performing checkpoint
-    if max_epochs > 0:
-        model.load_state_dict(torch.load(checkpoint_file))
+                # Keep checkpoint of best performing model (based on raw MRR)
+                if val_scores['mrr'] > best_valid_mrr:
+                    best_valid_mrr = val_scores['mrr']
+                    torch.save(model.module.state_dict(), checkpoint_file + '.pt')
+                    torch.save(model_neigh_sel.module.state_dict(), checkpoint_file + '_neigh_sel.pt')
+            else:
+                print(f'saving models to {checkpoint_file}.pt & {checkpoint_file}_neigh_sel.pt')
+                torch.save(model.module.state_dict(), checkpoint_file + '.pt')
+                torch.save(model_neigh_sel.module.state_dict(), checkpoint_file + '_neigh_sel.pt')
+
+            if wandb_logging:
+                avg_loss = train_loss / len(train_loader)
+                print(f'logging avg. train loss to wandb: {avg_loss}')
+                log_data = {"loss": avg_loss}
+                # todo also reactivate if evaluation time is reasonable
+                if evaluate:
+                    for k in ['mrr', 'hits@1', 'hits@3', 'hits@10', 'mr']:
+                        if k in val_scores:
+                            log_data[f'val_{k}'] = val_scores[k]
+                wandb.log(log_data, step=epoch)
+
+        # Evaluate with best performing checkpoint
+        if max_epochs > 0:
+            model.load_state_dict(torch.load(checkpoint_file + '.pt'))
+            model_neigh_sel.load_state_dict(torch.load(checkpoint_file + '_neigh_sel.pt'))
 
     if dataset == 'Wikidata5M':
         graph = nx.MultiDiGraph()
         graph.add_weighted_edges_from(valid_data.triples.tolist())
 
-    _log.info('Evaluating on validation set (with filtering)')
-    eval_link_prediction(model, valid_loader, train_data, train_val_ent,
-                         max_epochs + 1, emb_batch_size, prefix='valid',
-                         filtering_graph=graph,
-                         new_entities=val_new_ents,
-                         neighborhood_enrichment=neighborhood_enrichment,
-                         fusion_method=fusion_method)
+    _log.info('Evaluating on validation set')
 
-    if dataset == 'Wikidata5M':
-        graph = nx.MultiDiGraph()
-        graph.add_weighted_edges_from(test_data.triples.tolist())
+    # new for neighborhood attention
+    eval_link_prediction_neigh_attention(model,
+                                         valid_loader,
+                                         train_data,
+                                         train_val_ent,
+                                         max_num_batches=6,  # todo remove after debugging
+                                         prefix='valid',
+                                         filtering_graph=graph,
+                                         new_entities=val_new_ents,
+                                         neighborhood_selector=train_data.get_neighbors,
+                                         emb_dim=dim)
 
-    _log.info('Evaluating on test set')
-    _, ent_emb = eval_link_prediction(model, test_loader, train_data,
-                                      train_val_test_ent, max_epochs + 1,
-                                      emb_batch_size, prefix='test',
-                                      filtering_graph=graph,
-                                      new_entities=test_new_ents,
-                                      return_embeddings=True,
-                                      neighborhood_enrichment=neighborhood_enrichment,
-                                      fusion_method=fusion_method)
+    # if dataset == 'Wikidata5M':
+    #    graph = nx.MultiDiGraph()
+    #    graph.add_weighted_edges_from(test_data.triples.tolist())
+
+    # todo change to new evaluation function for neighborhood attention
+    # _log.info('Evaluating on test set')
+    # _, ent_emb = eval_link_prediction(model, test_loader, train_data,
+    #                                  train_val_test_ent, max_epochs + 1,
+    #                                  emb_batch_size, prefix='test',
+    #                                  filtering_graph=graph,
+    #                                  new_entities=test_new_ents,
+    #                                  return_embeddings=True,
+    #                                  neighborhood_enrichment=neighborhood_enrichment,
+    #                                  fusion_method=fusion_method)
 
     # Save final entity embeddings obtained with trained encoder
-    torch.save(ent_emb, osp.join(OUT_PATH, f'ent_emb-{_run._id}.pt'))
-    torch.save(train_val_test_ent, osp.join(OUT_PATH, f'ents-{_run._id}.pt'))
+    # torch.save(ent_emb, osp.join(OUT_PATH, f'ent_emb-{_run._id}.pt'))
+    # torch.save(train_val_test_ent, osp.join(OUT_PATH, f'ents-{_run._id}.pt'))
 
 
 @ex.command
@@ -693,7 +977,6 @@ def node_classification(dataset, checkpoint, _run: Run, _log: Logger):
     joblib.dump({'model': model,
                  'id_to_class': id_to_class},
                 osp.join('output', f'classifier-{checkpoint}.joblib'))
-
 
 
 ex.run_commandline()

@@ -302,6 +302,7 @@ class TextGraphDataset(GraphDataset):
 
 
     def get_entity_description(self, ent_ids):
+
         """Get entity descriptions for a tensor of entity IDs."""
         text_data = self.text_data[ent_ids]
         text_end_idx = text_data.shape[-1] - 1
@@ -355,7 +356,6 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         self.neighborhood_attention_model = None
         # create relation + neighbor descriptions scorer
 
-
         # load relation descriptions
         file_path = osp.join(self.directory, 'relation2text.txt')
         self.text_data_rel = torch.zeros((len(blp_rel_ids), max_len), dtype=torch.long)
@@ -382,7 +382,7 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
 
         # just for debugging
         if not use_cached_neighbors:
-
+            # todo improve neighborhood creation / loading
             self.load_page_link_graph_inductive(osp.join(self.directory, 'page_link_graph_typed.txt'),
                                                 osp.join(self.directory, 'inductive_page_link_graph_typed.pt'),
                                                 set(train_entities))
@@ -433,71 +433,94 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         #self.neighbors = neighbor_tensor[:, :self.num_neighbors]
         self.neighbors = neighbor_tensor
 
-    def get_neighbors(self, ent_ids, dynamic_selection='random', rels=None):
-        """Get neighbors according to some dynamic selection strategy."""
+    def get_neighbors(self, ent_ids, neigh_selection='random', rels=None, neighbor_focus=20) -> torch.Tensor:
+        """
+        Computes the neighborhood of the given entities.
+        @param ent_ids: list or 1D Tensor of entity ids that need a neighborhood
+        @param neigh_selection: method to select the neighbors. Options for
+                static/global neighborhood selection: random, no
+                dynamic/local neighborhood selection: attention
+        @param rels: if a dynamic/local neigh_selection is used, a list of relation ids these
+                entities are connected with as list or 1D Tensor
+        @param neighbor_focus: number of candidate neighbors considered by the dynamic/local neighborhood
+                selection
+        @return: neighborhood of the given entities as a tensor of entity ids
+        """
+        SEP_TOKEN_ID = 102
 
-        if dynamic_selection == 'random':
-            neighbors = self.neighbors[ent_ids][ :, torch.randperm(10)[:self.num_neighbors]]
-        elif dynamic_selection == 'no':
-            neighbors = self.neighbors[:, :self.num_neighbors][ent_ids]
-        else:
-            raise ValueError('Unknown dynamic selection strategy:', dynamic_selection)
+        if neigh_selection == 'random':
+            return self.neighbors[ent_ids][:, torch.randperm(neighbor_focus)[:self.num_neighbors]]
+        elif neigh_selection == 'no':
+            return self.neighbors[:, :self.num_neighbors][ent_ids]
+        elif neigh_selection == 'attention':
+            # neighbors are selected based on the learned relevance
 
-        batch_size = len(ent_ids)
+            # get relation descriptions: (batch_size, text_len)
+            text_token_rel = self.text_data_rel[rels]
+            # repeat relation descriptions for each candidate neighbor:
+            # (batch_size, text_len * num_neighbors) and transform to (batch_size * num_neighbors, text_len)
+            text_token_rel = text_token_rel.repeat(1, neighbor_focus).reshape(-1, text_token_rel.size(-1))
 
-        neighbors = torch.full((batch_size, self.num_neighbors), -1, dtype=torch.long)
-        for i, rel_id in enumerate(rels):
-            text_tok_rel = self.text_data_rel[rel_id.item()]
-            text_tok_rel_batch = text_tok_rel.repeat(20, 1)
+            # get entity descriptions: (batch_size * num_neighbors, text_len)
+            text_tok_ent, text_mask_ent, text_len_ent = self.get_entity_description(self.neighbors[ent_ids, :neighbor_focus].flatten())
 
-            # todo refactor magic number 20 and 102
-            text_tok_ent, text_mask_ent, text_len_ent = self.get_entity_description(self.neighbors[ent_ids[i], :20])
-
-            rel_neigh_tok = torch.cat([text_tok_rel_batch,
-                                     torch.full((text_tok_rel_batch.size(0), 1), 102),
-                                     text_tok_ent], dim=1)
+            # concatenate relation and entity descriptions: (batch_size * num_neighbors, text_len * 2)
+            rel_neigh_tok = torch.cat([text_token_rel,
+                                       torch.full((text_token_rel.size(0), 1), SEP_TOKEN_ID),
+                                       text_tok_ent], dim=1)
 
             rel_neigh_tok_mask = (rel_neigh_tok > 0).float()
 
-            x = self.neighborhood_attention_model._score_neigh_att(rel_neigh_tok.to(self.device), rel_neigh_tok_mask.to(self.device)).flatten()
+            # call the attention model
+            x = self.neighborhood_attention_model(rel_neigh_tok.to(self.device), rel_neigh_tok_mask.to(self.device))
+            x = x.reshape(rels.size(0), neighbor_focus)  # neighbor_focus was -1 before
 
-            indices_ = torch.argsort(x, descending=True)
-            neighbors_sorted = torch.gather(self.neighbors[ent_ids[i]], 0, indices_.cpu())
+            # sort neighbors according to their attention weights
+            indices_ = torch.argsort(x, descending=True, dim=1)
+            neighbors_sorted = torch.gather(self.neighbors[ent_ids, :neighbor_focus], 1, indices_.cpu())
 
-            # filter out -1 padding values and cut off after num_neighbors
-            neighbors_sorted = neighbors_sorted[neighbors_sorted != -1][:self.num_neighbors]
+            # remove -1 padding entries that might be sorted and occur somewhere in the middle
+            # or at the beginning
+            selected_neighbors = torch.full((len(ent_ids), self.num_neighbors), -1, dtype=torch.long)
+            for i in range(len(ent_ids)):
+                selected_neighbors_i = neighbors_sorted[i][neighbors_sorted[i] != -1][:self.num_neighbors]
+                selected_neighbors[i, :selected_neighbors_i.size(0)] = selected_neighbors_i
 
-            neighbors[i][:neighbors_sorted.size(0)] = neighbors_sorted
-
-        return neighbors
+            return selected_neighbors
 
     def collate_fn(self, data_list):
         """Given a batch of triples, return it in the form of
         entity descriptions, and the relation types between them.
         Use as a collate_fn for a DataLoader.
+        @param data_list: triple in shape [[heads, tails], rels]
+        @return:
         """
         batch_size = len(data_list) // self.num_devices
         if batch_size <= 1:
             raise ValueError('collate_text can only work with batch sizes'
                              ' larger than 1.')
 
+        # separate head + tail entities (pos_pairs) and relations
         pos_pairs, rels = torch.stack(data_list).split(2, dim=1)
 
         text_tok, text_mask, text_len = self.get_entity_description(pos_pairs)
 
-        neighbors_head = self.get_neighbors(pos_pairs[:, 0], rels=rels)
-        neighbors_tail = self.get_neighbors(pos_pairs[:, 1], rels=rels)
+        # a pair of head and tail needs the same relation, therefore we repeat the relation,
+        # transpose and flatten it
+        # changed: rel reshaping
+        neighbors = self.get_neighbors(pos_pairs.flatten(), rels=rels.repeat(1, 2).flatten(), neigh_selection='attention')
 
-        text_tok_neighborhood_head, text_mask_neighborhood_head, _ = self.get_entity_description(
-            neighbors_head)
+        text_tok_neighborhood_all, _, _ = self.get_entity_description(neighbors)
 
-        text_tok_neighborhood_tail, text_mask_neighborhood_tail, _ = self.get_entity_description(
-            neighbors_tail)
+        num_tokens = text_tok_neighborhood_all.size(-1)
 
         neg_idx = get_negative_sampling_indices(batch_size, self.neg_samples,
                                                 repeats=self.num_devices)
 
-        return text_tok, text_mask, rels, neg_idx, text_tok_neighborhood_head, text_mask_neighborhood_head, text_tok_neighborhood_tail, text_mask_neighborhood_tail
+        # added for evaluation
+        text_tok_neighborhood_all = text_tok_neighborhood_all.reshape(-1, self.num_neighbors, num_tokens)
+
+        return text_tok, text_mask, rels, neg_idx, text_tok_neighborhood_all
 
     def load_page_link_graph_inductive(self, raw_file_path, processed_file_path, train_entities):
         if os.path.isfile(processed_file_path):

@@ -68,6 +68,7 @@ class LinkPrediction(nn.Module):
         self.weighted_pooling = weighted_pooling
         self.edge_features = edge_features
         self.logger = logging.getLogger()
+        self.num_relations = num_relations
         # todo take neighborhood selection transformer as init parameter and add it here to the model as attribute
 
 
@@ -213,84 +214,49 @@ class InductiveLinkPrediction(LinkPrediction):
         avg = torch.sum(weights * features, dim=1) / torch.sum(weights, dim=1)
         return avg
 
-    def forward(self, text_tok, text_mask, rels=None, neg_idx=None, text_tok_neighborhood_head=None,
-                text_mask_neighborhood_head=None, text_tok_neighborhood_tail=None,
-                text_mask_neighborhood_tail=None):
+    def forward(self, text_tok, text_mask, rels=None, neg_idx=None, text_tok_neighborhood_all=None):
         """
         Shapes:
-            text_tok torch.Size([batch_size, 2, max_len])
-            text_tok_neighborhood_head torch.Size([batch_size, num_neighbors, max_len])
-            text_tok_neighborhood_head.view(-1, num_text_tokens) torch.Size([batch_size * num_neighbors, max_len])
+            text_tok torch.Size([batch_size * 2, max_len])
+            text_tok_neighborhood_all torch.Size([batch_size * 2, num_neighbors, max_len])
         """
 
-        batch_size, _, num_text_tokens = text_tok.shape
+        batch_size, num_text_tokens = text_tok.size(0), text_tok.size(-1)
 
-        if text_tok_neighborhood_head is None:
+        if text_tok_neighborhood_all is None:
             # without neighborhood
             # Encode text into an entity representation from its description
             ent_embs = self.encode(text_tok.view(-1, num_text_tokens),
                                    text_mask.view(-1, num_text_tokens))
         else:
             # with neighborhood
-            if self.fusion_method == 'BERT':
-                # uses tokenizer.sep_token_id = 102 for separating neighbors
-                # neigh_head_tail torch.Size([batch_size, 2 * num_neighbors, max_len])
-                neigh_head_tail = torch.cat([text_tok_neighborhood_head, text_tok_neighborhood_tail], dim=1)
-                # add sep token between neighbors torch.Size([batch_size, 2 * num_neighbors, max_len + 1])
-                neigh_head_tail = torch.cat([neigh_head_tail, torch.full((neigh_head_tail.size(0), neigh_head_tail.size(1), 1), 102).to(neigh_head_tail.device)], dim=2)
+            num_text_tokens_neigh = text_tok_neighborhood_all.size(-1)
 
-                neigh_head_tail_mask = torch.cat([text_mask_neighborhood_head,text_mask_neighborhood_tail], dim=1)
-                neigh_head_tail_mask = torch.cat([neigh_head_tail_mask, torch.ones((neigh_head_tail_mask.size(0), neigh_head_tail_mask.size(1), 1)).to(neigh_head_tail_mask.device)], dim=2)  # add sep token between neighbors mask
+            # flatten neighbors in order to be able to insert separation token inbetween them
+            # text_tok_neighborhood_fused torch.Size([batch_size, 2 * num_neighbors, max_len])
+            text_tok_neighborhood_all = text_tok_neighborhood_all.view(batch_size, -1, num_text_tokens_neigh)
 
-                ent_feature = torch.cat([text_tok.view(-1, num_text_tokens),
-                                         torch.full((text_tok.size(0) * 2, 1), 102).to(text_tok.device),
-                                         neigh_head_tail.view(-1, self.num_neighbors * num_text_tokens + self.num_neighbors)], dim=1)
+            # uses tokenizer.sep_token_id = 102 for separating neighbors,
+            # added between neighbors torch.Size([batch_size, 2 * num_neighbors, max_len + 1])
+            text_tok_neighborhood_fused = torch.cat([text_tok_neighborhood_all,
+                                         torch.full((text_tok_neighborhood_all.size(0),
+                                                     text_tok_neighborhood_all.size(1), 1), 102).to(text_tok_neighborhood_all.device)],
+                                        dim=2)
 
-                ent_feature_mask = torch.cat([text_mask.view(-1, num_text_tokens),
-                                              torch.full((text_mask.size(0) * 2, 1), 1).to(text_mask.device),
-                                              neigh_head_tail_mask.view(-1, self.num_neighbors * num_text_tokens + self.num_neighbors)], dim=1)
+           # text_tok + text_tok_neighborhood_fused
+            # entities
+            num_entities = text_tok.size(0) if neg_idx is None else text_tok.size(0) * 2
 
-                ent_embs = self.encode(ent_feature,
-                                       ent_feature_mask)
+            ent_feature = torch.cat([text_tok.view(-1, num_text_tokens),
+                                     torch.full((num_entities, 1), 102).to(text_tok.device),
+                                     text_tok_neighborhood_fused.view(-1, self.num_neighbors * num_text_tokens_neigh + self.num_neighbors)], dim=1)
 
-            elif self.fusion_method in ['linear', 'gate']:
-                # Encode text into an entity representation from its description
-                ent_embs = self.encode(text_tok.view(-1, num_text_tokens),
-                                       text_mask.view(-1, num_text_tokens))
+            ent_feature_mask = (ent_feature > 0).float()
 
-                with torch.no_grad():
-                    neigh_ent_embs_head = self.encode(text_tok_neighborhood_head.view(-1, num_text_tokens),
-                                                      text_mask_neighborhood_head.view(-1, num_text_tokens))
+            ent_embs = self.encode(ent_feature,
+                                   ent_feature_mask)
 
-                    neigh_ent_embs_tail = self.encode(text_tok_neighborhood_tail.view(-1, num_text_tokens),
-                                                      text_mask_neighborhood_tail.view(-1, num_text_tokens))
-
-                neigh_ent_embs_head_reshaped = neigh_ent_embs_head.reshape(
-                    (-1, self.num_neighbors, self.dim))
-                neigh_ent_embs_tail_reshaped = neigh_ent_embs_tail.reshape(
-                    (-1, self.num_neighbors, self.dim))
-
-                if self.weighted_pooling:
-                    neigh_ent_embs_head_avg_pool = self.weighted_neighborhood_pooling(
-                        neigh_ent_embs_head_reshaped).view(-1, self.dim)
-                    neigh_ent_embs_tail_avg_pool = self.weighted_neighborhood_pooling(
-                        neigh_ent_embs_tail_reshaped).view(-1, self.dim)
-                else:
-                    neigh_ent_embs_head_avg_pool = self.neighborhood_pooling(neigh_ent_embs_head_reshaped).view(
-                        -1, self.dim)
-                    neigh_ent_embs_tail_avg_pool = self.neighborhood_pooling(neigh_ent_embs_tail_reshaped).view(
-                        -1, self.dim)
-
-                neigh_ent_embs_pooled = torch.stack(
-                    (neigh_ent_embs_head_avg_pool, neigh_ent_embs_tail_avg_pool), dim=1).view(-1, self.dim)
-
-                if self.fusion_method == 'gate':
-                    ent_embs = self.gate(ent_embs, neigh_ent_embs_pooled)
-
-                else:
-                    ent_embs = self.linear_layer(torch.cat((ent_embs, neigh_ent_embs_pooled), dim=1))
-
-        if rels is None and neg_idx is None:
+        if neg_idx is None:
             # Forward is being used to compute entity embeddings only
             out = ent_embs
         else:
@@ -301,9 +267,27 @@ class InductiveLinkPrediction(LinkPrediction):
         return out
 
 
+class NeighborhoodSelectionTransformer(nn.Module):
+
+    def __init__(self, encoder_name):
+        super().__init__()
+        self.encoder_neigh_att = BertModel.from_pretrained(encoder_name,
+                                                           output_attentions=False,
+                                                           output_hidden_states=False)
+
+        self.enc_neigh_att_linear = nn.Linear(self.encoder_neigh_att.config.hidden_size, 1)
+
+    def forward(self, text_tok, text_mask):
+        x = self.encoder_neigh_att(text_tok, text_mask)[0][:, 0]
+        x = self.enc_neigh_att_linear(x)
+        x = torch.sigmoid(x)
+        return x
+
+
 class BertEmbeddingsLP(InductiveLinkPrediction):
     """BERT for Link Prediction (BLP)."""
 
+    # todo rework parameters and remove out-dated ones
     def __init__(self, dim, rel_model, loss_fn, num_relations, encoder_name,
                  regularizer, num_neighbors=5, fusion_method='BERT', edge_features=False, weighted_pooling=False):
         super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, num_neighbors,
@@ -314,26 +298,12 @@ class BertEmbeddingsLP(InductiveLinkPrediction):
         hidden_size = self.encoder.config.hidden_size
         self.enc_linear = nn.Linear(hidden_size, self.dim, bias=False)
 
-
-        self.encoder_neigh_att = BertModel.from_pretrained(encoder_name,
-                                                 # works as encoder_name == tokenizer_name
-                                                 output_attentions=False,
-                                                 output_hidden_states=False)
-
-        self.enc_neigh_att_linear = nn.Linear(self.encoder_neigh_att.config.hidden_size, 1)
-
-
     def _encode_entity(self, text_tok, text_mask):
         # Extract BERT representation of [CLS] token
         embs = self.encoder(text_tok, text_mask)[0][:, 0]
         embs = self.enc_linear(embs)
         return embs
 
-    def _score_neigh_att(self, text_tok, text_mask):
-        x = self.encoder_neigh_att(text_tok, text_mask)[0][:, 0]
-        x = self.enc_neigh_att_linear(x)
-        x = torch.sigmoid(x)
-        return x
 
 
 class WordEmbeddingsLP(InductiveLinkPrediction):
