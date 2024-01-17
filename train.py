@@ -2,6 +2,7 @@ import os
 import os.path as osp
 import random
 import string
+import time
 from datetime import datetime
 
 import networkx as nx
@@ -42,38 +43,11 @@ if all([uri, database]):
 """
 env (GPU Cluster): lp
 
-best performing model so far: 
-slurm_blp-fb15k237_transe_bert.sh
+# train model
 python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint=None checkpoint_neigh=None use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' wandb_logging=True
-python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint="./output/test_1.pt" checkpoint_neigh="./output/test_2.pt" use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' wandb_logging=True
 
-python train.py link_prediction with \
-dataset='FB15k-237' \
-inductive=True \
-dim=128 \
-model='blp' \
-rel_model='transe' \
-loss_fn='margin' \
-encoder_name='bert-base-cased' \
-regularizer=0 \
-max_len=32 \
-num_negatives=64 \
-lr=2e-5 \
-use_scheduler=True \
-batch_size=64 \
-emb_batch_size=512 \
-eval_batch_size=64 \
-max_epochs=40 \
-checkpoint=None \
-checkpoint_neigh=None \
-use_cached_text=True \
-use_cached_neighbors=True \
-neighborhood_enrichment=True \
-fusion_method='BERT' \
-num_neighbors=3 \
-neighborhood_selection='degree_train' \
-wandb_logging=True \
-
+# load checkpoints
+python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint="./output/test_1.pt" checkpoint_neigh="./output/test_2.pt" use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' wandb_logging=False
 """
 
 
@@ -130,14 +104,13 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
     else:
         max_ent_id = entities.max()
 
-
     # todo remove after debugging
     if os.path.exists(osp.join('./output', 'test_ent_emb.pt')):
         print('loading embeddings')
         ent_emb = torch.load(osp.join('./output', 'test_ent_emb.pt'))
         ent2idx = torch.load(osp.join('./output', 'test_ent2idx.pt'))
     else:
-        ent2idx = torch.full(max_ent_id + 1, fill_value=-1, dtype=torch.long)
+        ent2idx = torch.full([max_ent_id + 1], fill_value=-1, dtype=torch.long)
         ent_emb = torch.rand((num_entities, num_relations, emb_dim))
 
         rels = torch.arange(num_relations)
@@ -164,7 +137,6 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
     # evaluation code
     scores = {}
 
-
     mrr_by_position = torch.zeros(3, dtype=torch.float).to(device)
     mrr_pos_counts = torch.zeros_like(mrr_by_position)
 
@@ -186,7 +158,6 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
     _log.info('Computing metrics on set of triples')
     total = len(triples_loader) if max_num_batches is None else max_num_batches
 
-    triple_ranks_all = []
     triple_ranks_filtered_all = []
     for i, triples in enumerate(triples_loader):
 
@@ -226,8 +197,6 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
 
         pred_ents = torch.cat((heads_predictions, tails_predictions))
 
-        # todo indexing of true_ents is wrong -> might not be neccessary to fix as we are only interested in the filtered setting
-        # todo check dimensions
         true_ents = torch.cat((heads.flatten().unsqueeze(1),
                                tails.flatten().unsqueeze(1))).to(device)
 
@@ -455,9 +424,6 @@ def eval_link_prediction(model, triples_loader, text_dataset, entities,
     triple_ranks_all = []
     triple_ranks_filtered_all = []
     for i, triples in enumerate(triples_loader):
-        # todo remove after debugging
-        # if i == 2:
-        #    break
 
         if max_num_batches is not None and i == max_num_batches:
             break
@@ -733,7 +699,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
 
     if checkpoint is not None:
         _log.info(f'Loading model from checkpoint: {checkpoint}, {checkpoint_neigh}')
-        # model.load_state_dict(torch.load(checkpoint, map_location='cpu'))
+        model.load_state_dict(torch.load(checkpoint, map_location='cpu'))
         model_neigh_sel.load_state_dict(torch.load(checkpoint_neigh, map_location='cpu'))
         _log.info('Models loaded')
 
@@ -759,6 +725,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                    f'model-{encoder_name}-{datetime.now().strftime("%Y-%m-%d-%H-%M")}-{"".join([random.choice(string.ascii_lowercase) for _ in range(6)])}')
         _log.info(f'checkpoint_file: {checkpoint_file} + .pt/_neigh_sel.pt')
         # todo add time per batch estimation to logging
+        epoch_start_time = time.time()
         for epoch in range(1, max_epochs + 1):
             train_loss = 0
 
@@ -798,7 +765,10 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
             # print('log_data', log_data)
             # --- end: added for debugging
 
+
             for step, data in enumerate(train_loader):
+                batch_start_time = time.time()
+
                 loss = model(*data).mean()
 
                 optimizer.zero_grad()
@@ -819,7 +789,10 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                               f'[{step}/{len(train_loader)}]: {loss.item():.6f}')
                     _run.log_scalar('batch_loss', loss.item())
 
+                _log.info(f'Time per batch: {time.time() - batch_start_time}')
+
             _run.log_scalar('train_loss', train_loss / len(train_loader), epoch)
+            _log.info(f'Time per epoch: {time.time() - epoch_start_time}')
 
             # todo currently no evaluation during training. Reactivate if evaluation time is reasonable.
             evaluate = False
@@ -862,6 +835,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
 
         # Evaluate with best performing checkpoint
         if max_epochs > 0:
+            _log.info(f'--> Loading best model from checkpoint: {checkpoint_file}')
             model.load_state_dict(torch.load(checkpoint_file + '.pt'))
             model_neigh_sel.load_state_dict(torch.load(checkpoint_file + '_neigh_sel.pt'))
 
@@ -872,6 +846,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
     _log.info('Evaluating on validation set')
 
     # new for neighborhood attention
+    eval_start_time = time.time()
     eval_link_prediction_neigh_attention(model,
                                          valid_loader,
                                          train_data,
@@ -882,6 +857,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                          new_entities=val_new_ents,
                                          neighborhood_selector=train_data.get_neighbors,
                                          emb_dim=dim)
+    _log.info(f'Evaluation time: {time.time() - eval_start_time}')
 
     # if dataset == 'Wikidata5M':
     #    graph = nx.MultiDiGraph()
