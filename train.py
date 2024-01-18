@@ -90,14 +90,16 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
                                          _run: Run, _log: Logger,
                                          prefix='', max_num_batches=None,
                                          filtering_graph=None, new_entities=None,
-                                         return_embeddings=False,
                                          neighborhood_selector=None,
-                                         emb_dim=128, epoch=0):
-    _log.info('Starting evaluation with neighborhood attention')
+                                         emb_dim=128):
+    if neighborhood_selector is not None:
+        _log.info(f'Starting evaluation with neighborhood attention on {prefix} set.')
+
     num_entities = entities.shape[0]
     num_relations = model.module.num_relations
 
-    compute_filtered = True
+    compute_filtered = filtering_graph is not None
+    _log.info(f'Computing the filtered setting: {compute_filtered}.')
 
     if compute_filtered:
         max_ent_id = max(filtering_graph.nodes)
@@ -105,11 +107,12 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
         max_ent_id = entities.max()
 
     # todo remove after debugging
-    if os.path.exists(osp.join('./output', 'test_ent_emb.pt')):
-        print('loading embeddings')
-        ent_emb = torch.load(osp.join('./output', 'test_ent_emb.pt'))
-        ent2idx = torch.load(osp.join('./output', 'test_ent2idx.pt'))
+    if os.path.exists(osp.join('./output', f'{prefix}_ent_emb.pt')):
+        _log.info('Loading embeddings from file.')
+        ent_emb = torch.load(osp.join('./output', f'{prefix}_ent_emb.pt'))
+        ent2idx = torch.load(osp.join('./output', f'{prefix}_ent2idx.pt'))
     else:
+        _log.info('Computing embeddings.')
         ent2idx = torch.full([max_ent_id + 1], fill_value=-1, dtype=torch.long)
         ent_emb = torch.rand((num_entities, num_relations, emb_dim))
 
@@ -131,12 +134,11 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
 
             ent_emb[ent_idx] = batch_emb_id
 
-        torch.save(ent_emb, osp.join('./output', 'test_ent_emb.pt'))
-        torch.save(ent2idx, osp.join('./output', 'test_ent2idx.pt'))
+        _log.info('Saving embeddings.')
+        torch.save(ent_emb, osp.join('./output', f'{prefix}_ent_emb.pt'))
+        torch.save(ent2idx, osp.join('./output', f'{prefix}_ent2idx.pt'))
 
     # evaluation code
-    scores = {}
-
     mrr_by_position = torch.zeros(3, dtype=torch.float).to(device)
     mrr_pos_counts = torch.zeros_like(mrr_by_position)
 
@@ -158,6 +160,7 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
     _log.info('Computing metrics on set of triples')
     total = len(triples_loader) if max_num_batches is None else max_num_batches
 
+    triple_ranks_all = []
     triple_ranks_filtered_all = []
     for i, triples in enumerate(triples_loader):
 
@@ -182,7 +185,7 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
 
         # Score all possible heads and tails
         ent_emb_new = []
-        for r in tqdm(rels.flatten()):
+        for r in rels.flatten():
             ent_emb_new.append(ent_emb[:, r])
 
         # batch size x num entities x embedding dim
@@ -202,6 +205,13 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
 
         num_predictions += pred_ents.shape[0]
         reciprocals, hits, ranks = utils.get_metrics(pred_ents, true_ents, k_values)
+
+        # collect triples and their ranks for later analysis
+        ranks = torch.reshape(ranks, (2, -1))  # split head and tail ranks
+        triple_ranks = torch.cat(
+            (t, ranks[0].unsqueeze(1).cpu(), ranks[1].unsqueeze(1).cpu()), dim=1).type(torch.int32)
+        triple_ranks_all.append(triple_ranks)
+
         mrr += reciprocals.sum().item()
         hits_sum = hits.sum(dim=0)
 
@@ -216,13 +226,11 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
             pred_ents[filter_mask] = pred_ents.min() - 1.0
 
             reciprocals, hits, ranks = utils.get_metrics(pred_ents, true_ents, k_values)
-            ranks = torch.reshape(ranks, (2, -1))  # split head and tail ranks
 
-            # typecase just to be sure
+            # collect triples and their ranks for later analysis
+            ranks = torch.reshape(ranks, (2, -1))  # split head and tail ranks
             triple_ranks_filtered = torch.cat(
                 (t, ranks[0].unsqueeze(1).cpu(), ranks[1].unsqueeze(1).cpu()), dim=1).type(torch.int32)
-
-            print('triple_ranks_filtered', triple_ranks_filtered)
             triple_ranks_filtered_all.append(triple_ranks_filtered)
 
             mrr_filt += reciprocals.sum().item()
@@ -251,33 +259,36 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
             _log.info(f'[{i + 1:,}/{total:,}]')
 
     _log.info(f'The total number of predictions is {num_predictions:,}')
+
     for hits_dict in (hits_at_k, hits_at_k_filt):
         for k in hits_dict:
             hits_dict[k] /= num_predictions
-
     mrr = mrr / num_predictions
-    mrr_filt = mrr_filt / num_predictions
+    mr = triple_ranks_all[:, 3:].float().mean().item()
+
+    scores = {}
+    scores['mrr'] = mrr
+    scores['mr'] = mr
 
     log_str = f'{prefix} mrr: {mrr:.4f}  '
-    _run.log_scalar(f'{prefix}_mrr', mrr, epoch)
     for k, value in hits_at_k.items():
         scores[f'hits@{k}'] = value
         log_str += f'hits@{k}: {value:.4f}  '
-        _run.log_scalar(f'{prefix}_hits@{k}', value, epoch)
 
-    scores['mrr'] = mrr
     if compute_filtered:
-        triple_ranks_filtered_all = torch.cat(triple_ranks_filtered_all, dim=0)
-        log_str += f'mrr_filt: {mrr_filt:.4f}  '
+        mrr_filt = mrr_filt / num_predictions
+        mr_filt = triple_ranks_filtered_all[:, 3:].float().mean().item()
+
         scores['mrr_filt'] = mrr_filt
-        scores['mr_filt'] = triple_ranks_filtered_all[:, 3:].float().mean().item()
-        print('mr_filt:', scores['mr_filt'])
-        _run.log_scalar(f'{prefix}_mrr_filt', mrr_filt, epoch)
+        scores['mr_filt'] = mr_filt
+
+        log_str += f'mrr_filt: {mrr_filt:.4f}  '
+
         for k, value in hits_at_k_filt.items():
             scores[f'hits@{k}_filt'] = value
             log_str += f'hits@{k}_filt: {value:.4f}  '
-            _run.log_scalar(f'{prefix}_hits@{k}_filt', value, epoch)
 
+    # logging all default metrics to stdout
     _log.info(log_str)
 
     if new_entities is not None and compute_filtered:
@@ -289,7 +300,6 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
                                f'{prefix}_mrr_filt_tail_new')):
             value = mrr_by_position[i].item()
             log_str += f'{t}: {value:.4f}  '
-            _run.log_scalar(t, value, epoch)
         _log.info(log_str)
 
     if compute_filtered and triples_loader.dataset.has_rel_categories:
@@ -302,14 +312,7 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
                 log_str += f'{cat}_mrr: {mrr_by_category[i, cat_id]:.4f}  '
             _log.info(log_str)
 
-    if return_embeddings:
-        out = (scores, ent_emb)
-    else:
-        out = (scores, None)
-
-    print(scores)
-
-    return out
+    return scores
 
 
 @ex.capture
@@ -765,7 +768,6 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
             # print('log_data', log_data)
             # --- end: added for debugging
 
-
             for step, data in enumerate(train_loader):
                 batch_start_time = time.time()
 
@@ -844,14 +846,11 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
         graph.add_weighted_edges_from(valid_data.triples.tolist())
 
     _log.info('Evaluating on validation set')
-
-    # new for neighborhood attention
     eval_start_time = time.time()
     eval_link_prediction_neigh_attention(model,
                                          valid_loader,
                                          train_data,
                                          train_val_ent,
-                                         max_num_batches=6,  # todo remove after debugging
                                          prefix='valid',
                                          filtering_graph=graph,
                                          new_entities=val_new_ents,
@@ -859,24 +858,22 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                          emb_dim=dim)
     _log.info(f'Evaluation time: {time.time() - eval_start_time}')
 
-    # if dataset == 'Wikidata5M':
-    #    graph = nx.MultiDiGraph()
-    #    graph.add_weighted_edges_from(test_data.triples.tolist())
+    if dataset == 'Wikidata5M':
+        graph = nx.MultiDiGraph()
+        graph.add_weighted_edges_from(test_data.triples.tolist())
 
-    # todo change to new evaluation function for neighborhood attention
-    # _log.info('Evaluating on test set')
-    # _, ent_emb = eval_link_prediction(model, test_loader, train_data,
-    #                                  train_val_test_ent, max_epochs + 1,
-    #                                  emb_batch_size, prefix='test',
-    #                                  filtering_graph=graph,
-    #                                  new_entities=test_new_ents,
-    #                                  return_embeddings=True,
-    #                                  neighborhood_enrichment=neighborhood_enrichment,
-    #                                  fusion_method=fusion_method)
-
-    # Save final entity embeddings obtained with trained encoder
-    # torch.save(ent_emb, osp.join(OUT_PATH, f'ent_emb-{_run._id}.pt'))
-    # torch.save(train_val_test_ent, osp.join(OUT_PATH, f'ents-{_run._id}.pt'))
+    _log.info('Evaluating on test set')
+    eval_start_time = time.time()
+    eval_link_prediction_neigh_attention(model,
+                                         test_loader,
+                                         train_data,
+                                         train_val_test_ent,
+                                         prefix='test',
+                                         filtering_graph=graph,
+                                         new_entities=test_new_ents,
+                                         neighborhood_selector=train_data.get_neighbors,
+                                         emb_dim=dim)
+    _log.info(f'Evaluation time: {time.time() - eval_start_time}')
 
 
 @ex.command
