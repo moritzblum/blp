@@ -7,9 +7,6 @@ from transformers import BertModel
 import logging
 
 
-
-
-
 class Gate(nn.Module):
 
     def __init__(self,
@@ -69,10 +66,6 @@ class LinkPrediction(nn.Module):
         self.edge_features = edge_features
         self.logger = logging.getLogger()
         self.num_relations = num_relations
-        # todo take neighborhood selection transformer as init parameter and add it here to the model as attribute
-
-
-
 
         if edge_features:
             self.logger.info('Loading relation features from file.')
