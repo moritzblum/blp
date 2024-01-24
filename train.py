@@ -21,7 +21,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 import joblib
 
-from data import CATEGORY_IDS, RANDOM
+from data import CATEGORY_IDS, RANDOM, get_negative_sampling_indices
 from data import GraphDataset, TextGraphDataset, GloVeTokenizer, NeighborhoodTextGraphDataset
 import models
 import utils
@@ -44,10 +44,13 @@ if all([uri, database]):
 env (GPU Cluster): lp
 
 # train model
-python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint=None checkpoint_neigh=None use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' wandb_logging=True
+python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint=None checkpoint_neigh=None use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' permute_neighbors=True wandb_logging=True
 
 # load checkpoints
 python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint="./output/model-attention.pt" checkpoint_neigh="./output/model-attention_neigh_sel.pt" use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' wandb_logging=False
+
+python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint="./output/model-bert-base-cased-2024-01-22-10-24-mstzla.pt" checkpoint_neigh="./output/model-bert-base-cased-2024-01-22-18-41-qexewv_neigh_sel.pt" use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' wandb_logging=False
+
 
 without neighborhood enrichment
 python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint="./output/model-baseline.pt" checkpoint_neigh=None use_cached_text=True neighborhood_enrichment=False wandb_logging=False
@@ -84,9 +87,59 @@ def config():
     # neighborhood selection strategy
     num_neighbors = 5
     neighborhood_selection = RANDOM
+    permute_neighbors = False
     # logging
     wandb_logging = False
     edge_features = False
+
+
+@ex.capture
+@torch.no_grad()
+def eval_link_prediction_neigh_attention_loss(model, triples_loader, text_dataset, _log, num_negative, prefix='test'):
+    eval_loss_all = 0
+    _log.info(f'Evaluating Loss on {prefix} set.')
+
+    for i, triples in enumerate(tqdm(triples_loader)):
+        heads, tails, rels = torch.chunk(triples, chunks=3, dim=1)
+
+        heads = heads.flatten()
+        tails = tails.flatten()
+        rels = rels.flatten()
+
+        if heads.size(0) == 64:
+            continue
+
+        text_tok_head, text_mask_head, _ = text_dataset.get_entity_description(heads)
+        text_tok_tail, text_mask_tail, _ = text_dataset.get_entity_description(tails)
+
+        neighbors_head = text_dataset.get_neighbors(heads, rels=rels,
+                                                  neigh_selection='attention')
+        neighbors_tail = text_dataset.get_neighbors(tails, rels=rels,
+                                                  neigh_selection='attention')
+
+        text_tok_neighbors_head, _, _ = text_dataset.get_entity_description(
+            neighbors_head)
+        text_tok_neighbors_tail, _, _ = text_dataset.get_entity_description(
+            neighbors_tail)
+
+        batch_emb_head = model(text_tok=text_tok_head.reshape((-1, 32)).to(device),
+                               text_mask=text_mask_head.reshape((-1, 32)).to(device),
+                               text_tok_neighborhood_all=text_tok_neighbors_head.to(device))
+
+        batch_emb_tail = model(text_tok=text_tok_tail.reshape((-1, 32)).to(device),
+                               text_mask=text_mask_tail.reshape((-1, 32)).to(device),
+                               text_tok_neighborhood_all=text_tok_neighbors_tail.to(device))
+
+        neg_idx = get_negative_sampling_indices(batch_emb_head.size(0), num_negative)
+
+        eval_loss = model.module.compute_loss(torch.stack((batch_emb_head, batch_emb_tail), dim=1), rels.unsqueeze(dim=1).to(device), neg_idx).mean()
+        eval_loss_all += eval_loss.item()
+
+    avg_eval_loss = eval_loss_all / len(triples_loader)
+
+    _log.info(f'Avg. {prefix} loss: {avg_eval_loss:.4f}')
+
+    return avg_eval_loss
 
 
 @ex.capture
@@ -150,6 +203,10 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
         for ent_idx, ent_id in enumerate(tqdm(entities.tolist())):
             ent2idx[ent_id] = ent_idx
 
+            # todo remove after debugging
+            if ent_id not in new_entities:
+                continue
+
             if neighborhood_selector is None:
                 text_tok, text_mask, _ = text_dataset.get_entity_description(torch.tensor([ent_id]))
                 text_tok_neighbors = None
@@ -162,7 +219,8 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
             text_len = text_tok.size(1)
             batch_emb_id = model(text_tok=text_tok.reshape((-1, text_len)).to(device),
                                  text_mask=text_mask.reshape((-1, text_len)).to(device),
-                                 text_tok_neighborhood_all=text_tok_neighbors)
+                                 text_tok_neighborhood_all=text_tok_neighbors.to(device))
+
 
             ent_emb[ent_idx] = batch_emb_id
 
@@ -614,7 +672,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                     use_scheduler, batch_size, emb_batch_size, eval_batch_size,
                     max_epochs, checkpoint, checkpoint_neigh, use_cached_text, use_cached_neighbors,
                     neighborhood_enrichment, num_neighbors, edge_features, fusion_method,
-                    weighted_pooling, neighborhood_selection, wandb_logging,
+                    weighted_pooling, neighborhood_selection, permute_neighbors, wandb_logging,
                     _run: Run, _log: Logger):
     _log.info(f'config: {_run.config}')
 
@@ -671,7 +729,8 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                                       use_cached_neighbors=use_cached_neighbors,
                                                       num_devices=num_devices,
                                                       device=device,
-                                                      tokenizer_name=tokenizer_name)
+                                                      tokenizer_name=tokenizer_name,
+                                                      permute_neighbors=permute_neighbors)
         else:
             train_data = TextGraphDataset(triples_file,
                                           num_negatives,
@@ -831,6 +890,13 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
             _run.log_scalar('train_loss', train_loss / len(train_loader), epoch)
             _log.info(f'Time per epoch: {time.time() - epoch_start_time}')
 
+            eval_loss_ = eval_link_prediction_neigh_attention_loss(model, valid_loader, train_data,
+                                                                   _log=_log, num_negative=num_negatives,
+                                                                   prefix='valid')
+            test_loss_ = eval_link_prediction_neigh_attention_loss(model, test_loader, train_data,
+                                                                   _log=_log, num_negative=num_negatives,
+                                                                   prefix='test')
+
             # todo currently no evaluation during training. Reactivate if evaluation time is reasonable.
             evaluate = False
             if evaluate:
@@ -860,10 +926,11 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                 if neighborhood_enrichment:
                     torch.save(model_neigh_sel.module.state_dict(), checkpoint_file + '_neigh_sel.pt')
 
+
             if wandb_logging:
                 avg_loss = train_loss / len(train_loader)
                 print(f'logging avg. train loss to wandb: {avg_loss}')
-                log_data = {"loss": avg_loss}
+                log_data = {"loss": avg_loss, "eval_loss": eval_loss_, "test_loss": test_loss_}
                 # todo also reactivate if evaluation time is reasonable
                 if evaluate:
                     for k in ['mrr', 'hits@1', 'hits@3', 'hits@10', 'mr']:
@@ -882,6 +949,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
         graph = nx.MultiDiGraph()
         graph.add_weighted_edges_from(valid_data.triples.tolist())
 
+    """
     _log.info('Evaluating on validation set')
     eval_start_time = time.time()
     eval_link_prediction_neigh_attention(model,
@@ -894,6 +962,7 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                          neighborhood_selector=train_data.get_neighbors if neighborhood_enrichment else None,
                                          emb_dim=dim)
     _log.info(f'Evaluation time: {time.time() - eval_start_time}')
+    """
 
     if dataset == 'Wikidata5M':
         graph = nx.MultiDiGraph()

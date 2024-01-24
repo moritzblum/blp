@@ -46,6 +46,8 @@ def file_to_ids(file_path):
     return str2id
 
 
+# todo negative sampling must be adapted to the new neighborhood setting, otherwise, the relation
+#  entity tuples for the neighborhood attention are wrong
 def get_negative_sampling_indices(batch_size, num_negatives, repeats=1):
     """"Obtain indices for negative sampling within a batch of entity pairs.
     Indices are sampled from a reshaped array of indices. For example,
@@ -339,7 +341,7 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
     def __init__(self, triples_file, neg_samples, max_len, tokenizer,
                  drop_stopwords, num_neighbors=5, selection=RANDOM, write_maps_file=False,
                  use_cached_text=False, use_cached_neighbors=False,
-                 num_devices=1, device=None, tokenizer_name='bert-base-uncased', dataset_name='wikidata5m'):
+                 num_devices=1, device=None, tokenizer_name='bert-base-uncased', dataset_name='wikidata5m', permute_neighbors=True):
 
         super().__init__(triples_file, neg_samples, max_len, tokenizer,
                          drop_stopwords, write_maps_file, use_cached_text,
@@ -348,6 +350,7 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         self.device = device
         self.num_neighbors = num_neighbors
         self.selection = selection
+        self.permute_neighbors = permute_neighbors
 
         self.maps = torch.load(self.maps_path)
         blp_ent_ids = self.maps['ent_ids']  # mapping: entity URI -> ID
@@ -385,7 +388,7 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
             # todo improve neighborhood creation / loading
             self.load_page_link_graph_inductive(osp.join(self.directory, 'page_link_graph_typed.txt'),
                                                 osp.join(self.directory, 'inductive_page_link_graph_typed.pt'),
-                                                set(train_entities))
+                                                set(train_entities.tolist()))
 
             self.page_link_graph_edge_index = torch.stack(
                 [self.page_link_graph[:, 0], self.page_link_graph[:, 2]]).to(self.device)
@@ -402,7 +405,7 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
                                                                 self.page_link_graph_edge_index,
                                                                 relabel_nodes=False,
                                                                 flow="target_to_source",
-                                                                directed=True)
+                                                                directed=True)  # todo maybe try undirected, too
                     neighbor_dict[id] = torch.unique(edge_index_sample).cpu()
                 torch.save(neighbor_dict, pre_computed_direct_neighborhood_file)
             else:
@@ -433,7 +436,7 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         #self.neighbors = neighbor_tensor[:, :self.num_neighbors]
         self.neighbors = neighbor_tensor
 
-    def get_neighbors(self, ent_ids, neigh_selection='random', rels=None, neighbor_focus=20) -> torch.Tensor:
+    def get_neighbors(self, ent_ids, neigh_selection='random', rels=None, neighbor_focus=20, permute_neighbors=False) -> torch.Tensor:
         """
         Computes the neighborhood of the given entities.
         @param ent_ids: list or 1D Tensor of entity ids that need a neighborhood
@@ -455,14 +458,30 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         elif neigh_selection == 'attention':
             # neighbors are selected based on the learned relevance
 
-            # get relation descriptions: (batch_size, text_len)
-            text_token_rel = self.text_data_rel[rels]
-            # repeat relation descriptions for each candidate neighbor:
-            # (batch_size, text_len * num_neighbors) and transform to (batch_size * num_neighbors, text_len)
-            text_token_rel = text_token_rel.repeat(1, neighbor_focus).reshape(-1, text_token_rel.size(-1))
 
-            # get entity descriptions: (batch_size * num_neighbors, text_len)
-            text_tok_ent, text_mask_ent, text_len_ent = self.get_entity_description(self.neighbors[ent_ids, :neighbor_focus].flatten())
+            if rels is None:
+                text_token_rel = torch.tensor([])
+            else:
+
+                # get relation descriptions: (batch_size, text_len)
+                text_token_rel = self.text_data_rel[rels]
+                # repeat relation descriptions for each candidate neighbor:
+                # (batch_size, text_len * num_neighbors) and transform to (batch_size * num_neighbors, text_len)
+                text_token_rel = text_token_rel.repeat(1, neighbor_focus).reshape(-1, text_token_rel.size(-1))
+
+                # get entity descriptions: (batch_size * num_neighbors, text_len)
+
+            # permute neighbors before selection to make the neighborhood selection model more robust
+            if permute_neighbors:
+                neigh_focus_subset_new = torch.full_like(self.neighbors[ent_ids, :neighbor_focus], -1)
+                for idx, neigh_row in enumerate(self.neighbors[ent_ids]):
+                    n = neigh_row[:neighbor_focus][torch.randperm(neighbor_focus)]
+                    neigh_focus_subset_new[idx, :(neigh_row != -1).sum()] = n[(n != -1)]
+
+            else:
+                neigh_focus_subset_new = self.neighbors[ent_ids, :neighbor_focus]
+
+            text_tok_ent, text_mask_ent, text_len_ent = self.get_entity_description(neigh_focus_subset_new.flatten())
 
             # concatenate relation and entity descriptions: (batch_size * num_neighbors, text_len * 2)
             rel_neigh_tok = torch.cat([text_token_rel,
@@ -477,7 +496,7 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
 
             # sort neighbors according to their attention weights
             indices_ = torch.argsort(x, descending=True, dim=1)
-            neighbors_sorted = torch.gather(self.neighbors[ent_ids, :neighbor_focus], 1, indices_.cpu())
+            neighbors_sorted = torch.gather(neigh_focus_subset_new, 1, indices_.cpu())
 
             # remove -1 padding entries that might be sorted and occur somewhere in the middle
             # or at the beginning
@@ -508,7 +527,10 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         # a pair of head and tail needs the same relation, therefore we repeat the relation,
         # transpose and flatten it
         # changed: rel reshaping
-        neighbors = self.get_neighbors(pos_pairs.flatten(), rels=rels.repeat(1, 2).flatten(), neigh_selection='attention')
+        neighbors = self.get_neighbors(pos_pairs.flatten(),
+                                       rels= rels.repeat(1, 2).flatten(),
+                                       neigh_selection='attention',
+                                       permute_neighbors=self.permute_neighbors)
 
         text_tok_neighborhood_all, _, _ = self.get_entity_description(neighbors)
 
@@ -533,7 +555,7 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
 
             page_links_graph_raw = []
             skipped = 0
-            print(raw_file_path)
+            print('Page Link Graph file:', raw_file_path)
             with open(raw_file_path) as page_linkes_raw_in:
                 for line in page_linkes_raw_in:
                     head, relation, tail = line.strip().split('\t')
@@ -550,17 +572,21 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
             mask_allowed_triples = []
             for i in tqdm(range(page_links_graph_raw.size(0))):
                 head, relation, tail = page_links_graph_raw[i][0].item(), page_links_graph_raw[i][
-                    1].item(), \
-                                       page_links_graph_raw[i][2].item()
+                    1].item(), page_links_graph_raw[i][2].item()
+
+                # todo this might be a problem for the inductive setting -> already changed (maybe make an option)
                 # if an entity has a page link to a test entity, this link is removed if the entity itself is in
                 # the training set. If the entity is also a test entity, there is no issue.
+
+
                 if tail in train_entities:
                     mask_allowed_triples.append(True)
                 else:
-                    if head in train_entities:
-                        mask_allowed_triples.append(False)
-                    else:
-                        mask_allowed_triples.append(True)
+                    mask_allowed_triples.append(False)
+                    #if head in train_entities:
+                    #    mask_allowed_triples.append(False)
+                    #else:
+                    #    mask_allowed_triples.append(True)
 
             print('Ratio of triples maintained:',
                   sum([1 for x in mask_allowed_triples if x]) / page_links_graph_raw.size(0))

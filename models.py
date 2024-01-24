@@ -136,6 +136,7 @@ class LinkPrediction(nn.Module):
         neg_embs = ent_embs.view(batch_size * 2, -1)[neg_idx]
         heads, tails = torch.chunk(neg_embs, chunks=2, dim=2)
         # neg heads torch.Size([512, 64, 1, 128])
+
         neg_scores = self.score_fn(heads.squeeze(), tails.squeeze(), rels)
 
         # pos vs neg size: torch.Size([512, 1]) torch.Size([512, 64])
