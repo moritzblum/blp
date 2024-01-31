@@ -52,7 +52,7 @@ class LinkPrediction(nn.Module):
             raise ValueError(f'Unknown relational model {self.rel_model}.')
 
     def __init__(self, dim, rel_model, loss_fn, num_relations, regularizer,
-                 num_neighbors=5, fusion_method='BERT', edge_features=False, weighted_pooling=False):
+                 num_neighbors=5, edge_features=False, weighted_pooling=False):
 
         super().__init__()
 
@@ -61,7 +61,6 @@ class LinkPrediction(nn.Module):
         self.regularizer = regularizer
         self.rel_model = rel_model
         self.num_neighbors = num_neighbors
-        self.fusion_method = fusion_method  # 'BERT' or 'linear' or 'gate'
         self.weighted_pooling = weighted_pooling
         self.edge_features = edge_features
         self.logger = logging.getLogger()
@@ -80,12 +79,6 @@ class LinkPrediction(nn.Module):
         else:
             self.rel_emb = nn.Embedding(num_relations, self.dim)
             nn.init.xavier_uniform_(self.rel_emb.weight.data)
-
-        if self.fusion_method == 'gate':
-            self.gate = Gate(self.dim * 2, self.dim)
-
-        if self.fusion_method == 'linear':
-            self.linear_layer = nn.Linear(self.dim * 2, self.dim)
 
         if self.rel_model == 'ermlp':
             self.ermlp_linear_hidden = nn.Linear(self.dim * 3, self.dim)
@@ -283,9 +276,9 @@ class BertEmbeddingsLP(InductiveLinkPrediction):
 
     # todo rework parameters and remove out-dated ones
     def __init__(self, dim, rel_model, loss_fn, num_relations, encoder_name,
-                 regularizer, num_neighbors=5, fusion_method='BERT', edge_features=False, weighted_pooling=False):
+                 regularizer, num_neighbors=5, edge_features=False, weighted_pooling=False):
         super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, num_neighbors,
-                         fusion_method, edge_features, weighted_pooling)
+                        edge_features, weighted_pooling)
         self.encoder = BertModel.from_pretrained(encoder_name,
                                                  output_attentions=False,
                                                  output_hidden_states=False)
@@ -306,7 +299,7 @@ class WordEmbeddingsLP(InductiveLinkPrediction):
     """
 
     def __init__(self, rel_model, loss_fn, num_relations, regularizer,
-                 dim=None, encoder_name=None, embeddings=None, num_neighbors=5, fusion_method='BERT', edge_features=False,
+                 dim=None, encoder_name=None, embeddings=None, num_neighbors=5, edge_features=False,
                  weighted_pooling=False):
         if not encoder_name and not embeddings:
             raise ValueError('Must provided one of encoder_name or embeddings')
@@ -325,7 +318,7 @@ class WordEmbeddingsLP(InductiveLinkPrediction):
             dim = embeddings.embedding_dim
 
         super().__init__(dim, rel_model, loss_fn, num_relations, regularizer, num_neighbors,
-                         fusion_method, edge_features, weighted_pooling)
+                         edge_features, weighted_pooling)
 
         self.embeddings = embeddings
 
@@ -358,11 +351,11 @@ class DKRL(WordEmbeddingsLP):
     """
 
     def __init__(self, dim, rel_model, loss_fn, num_relations, regularizer,
-                 encoder_name=None, embeddings=None, num_neighbors=5, fusion_method='BERT', edge_features=False,
+                 encoder_name=None, embeddings=None, num_neighbors=5, edge_features=False,
                  weighted_pooling=False):
         super().__init__(rel_model, loss_fn, num_relations, regularizer,
                          dim, encoder_name, embeddings,
-                         num_neighbors, fusion_method, edge_features, weighted_pooling)
+                         num_neighbors, edge_features, weighted_pooling)
 
         emb_dim = self.embeddings.embedding_dim
         self.conv1 = nn.Conv1d(emb_dim, self.dim, kernel_size=2)

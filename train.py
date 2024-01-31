@@ -21,7 +21,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 import joblib
 
-from data import CATEGORY_IDS, RANDOM, get_negative_sampling_indices
+from data import CATEGORY_IDS, RANDOM, get_negative_sampling_indices, ATTENTION
 from data import GraphDataset, TextGraphDataset, GloVeTokenizer, NeighborhoodTextGraphDataset
 import models
 import utils
@@ -41,19 +41,20 @@ if all([uri, database]):
     ex.observers.append(MongoObserver(uri, database))
 
 """
-env (GPU Cluster): lp
-
-# train model
-python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint=None checkpoint_neigh=None use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' permute_neighbors=True wandb_logging=True
-
-# load checkpoints
-python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint="./output/model-attention.pt" checkpoint_neigh="./output/model-attention_neigh_sel.pt" use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' wandb_logging=False
-
-python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint="./output/model-bert-base-cased-2024-01-22-10-24-mstzla.pt" checkpoint_neigh="./output/model-bert-base-cased-2024-01-22-18-41-qexewv_neigh_sel.pt" use_cached_text=True use_cached_neighbors=True neighborhood_enrichment=True fusion_method='BERT' num_neighbors=3 neighborhood_selection='degree_train' wandb_logging=False
+# -- comments ---
+* env (GPU Cluster): lp
 
 
-without neighborhood enrichment
-python train.py link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 checkpoint="./output/model-baseline.pt" checkpoint_neigh=None use_cached_text=True neighborhood_enrichment=False wandb_logging=False
+
+# --- train model ---
+# baseline
+python train.py -u link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 use_cached_text=True neighborhood_enrichment=False wandb_logging=True
+# random neighborhood selection 
+python train.py -u link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 use_cached_text=True neighborhood_enrichment=True use_cached_neighbors=True num_neighbors=3 neigh_ordering='degree_train' neigh_selection='random' wandb_logging=True
+# neighborhood selection by deegree
+python train.py -u link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 use_cached_text=True neighborhood_enrichment=True use_cached_neighbors=True num_neighbors=3 neigh_ordering='degree_train' neigh_selection='no' wandb_logging=True
+# attention neighborhood selection
+python train.py -u link_prediction with dataset='FB15k-237' inductive=True dim=128 model='blp' rel_model='transe' loss_fn='margin' encoder_name='bert-base-cased' regularizer=0 max_len=32 num_negatives=64 lr=2e-5 use_scheduler=True batch_size=64 emb_batch_size=512 eval_batch_size=64 max_epochs=40 use_cached_text=True neighborhood_enrichment=True use_cached_neighbors=True num_neighbors=3 neigh_ordering='degree_train' neigh_selection='attention' wandb_logging=True
 
 
 """
@@ -82,12 +83,11 @@ def config():
     use_cached_text = False
     use_cached_neighbors = False
     neighborhood_enrichment = False
-    fusion_method = 'BERT'
     weighted_pooling = False
     # neighborhood selection strategy
     num_neighbors = 5
-    neighborhood_selection = RANDOM
-    permute_neighbors = False
+    neigh_ordering = RANDOM
+    neigh_selection = ATTENTION
     # logging
     wandb_logging = False
     edge_features = False
@@ -95,7 +95,9 @@ def config():
 
 @ex.capture
 @torch.no_grad()
-def eval_link_prediction_neigh_attention_loss(model, triples_loader, text_dataset, _log, num_negative, prefix='test'):
+def eval_link_prediction_neigh_attention_avg_loss(model, triples_loader, text_dataset, _log, num_negative,
+                                                  prefix='test', neighborhood_enrichment=True,
+                                                  neigh_selection='attention'):
     eval_loss_all = 0
     _log.info(f'Evaluating Loss on {prefix} set.')
 
@@ -106,33 +108,43 @@ def eval_link_prediction_neigh_attention_loss(model, triples_loader, text_datase
         tails = tails.flatten()
         rels = rels.flatten()
 
-        if heads.size(0) == 64:
-            continue
-
         text_tok_head, text_mask_head, _ = text_dataset.get_entity_description(heads)
         text_tok_tail, text_mask_tail, _ = text_dataset.get_entity_description(tails)
 
-        neighbors_head = text_dataset.get_neighbors(heads, rels=rels,
-                                                  neigh_selection='attention')
-        neighbors_tail = text_dataset.get_neighbors(tails, rels=rels,
-                                                  neigh_selection='attention')
+        if not neighborhood_enrichment:
+            batch_emb_head = model(text_tok=text_tok_head.to(device),
+                                   text_mask=text_mask_head.to(device),
+                                   text_tok_neighborhood_all=None)
 
-        text_tok_neighbors_head, _, _ = text_dataset.get_entity_description(
-            neighbors_head)
-        text_tok_neighbors_tail, _, _ = text_dataset.get_entity_description(
-            neighbors_tail)
+            batch_emb_tail = model(text_tok=text_tok_tail.to(device),
+                                   text_mask=text_mask_tail.to(device),
+                                   text_tok_neighborhood_all=None)
 
-        batch_emb_head = model(text_tok=text_tok_head.reshape((-1, 32)).to(device),
-                               text_mask=text_mask_head.reshape((-1, 32)).to(device),
-                               text_tok_neighborhood_all=text_tok_neighbors_head.to(device))
+        else:
+            neighbors_head = text_dataset.get_neighbors(heads, rels=None,
+                                                        neigh_selection=neigh_selection)
+            neighbors_tail = text_dataset.get_neighbors(tails, rels=None,
+                                                        neigh_selection=neigh_selection)
 
-        batch_emb_tail = model(text_tok=text_tok_tail.reshape((-1, 32)).to(device),
-                               text_mask=text_mask_tail.reshape((-1, 32)).to(device),
-                               text_tok_neighborhood_all=text_tok_neighbors_tail.to(device))
+            text_tok_neighbors_head, _, _ = text_dataset.get_entity_description(
+                neighbors_head)
+            text_tok_neighbors_tail, _, _ = text_dataset.get_entity_description(
+                neighbors_tail)
+
+            batch_emb_head = model(
+                text_tok=text_tok_head.reshape((-1, text_tok_head.size(-1))).to(device),
+                text_mask=text_mask_head.reshape((-1, text_mask_head.size(-1))).to(device),
+                text_tok_neighborhood_all=text_tok_neighbors_head.to(device))
+
+            batch_emb_tail = model(
+                text_tok=text_tok_tail.reshape((-1, text_tok_tail.size(-1))).to(device),
+                text_mask=text_mask_tail.reshape((-1, text_mask_tail.size(-1))).to(device),
+                text_tok_neighborhood_all=text_tok_neighbors_tail.to(device))
 
         neg_idx = get_negative_sampling_indices(batch_emb_head.size(0), num_negative)
 
-        eval_loss = model.module.compute_loss(torch.stack((batch_emb_head, batch_emb_tail), dim=1), rels.unsqueeze(dim=1).to(device), neg_idx).mean()
+        eval_loss = model.module.compute_loss(torch.stack((batch_emb_head, batch_emb_tail), dim=1),
+                                              rels.unsqueeze(dim=1).to(device), neg_idx).mean()
         eval_loss_all += eval_loss.item()
 
     avg_eval_loss = eval_loss_all / len(triples_loader)
@@ -149,11 +161,11 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
                                          prefix='', max_num_batches=None,
                                          filtering_graph=None, new_entities=None,
                                          neighborhood_selector=None,
-                                         emb_dim=128):
+                                         emb_dim=128, neigh_selection='attention'):
     if neighborhood_selector is None:
-        _log.info(f'Starting evaluation without neighborhood attention on {prefix} set.')
+        _log.info(f'Starting evaluation > without < neighborhood attention on {prefix} set.')
     else:
-        _log.info(f'Starting evaluation with neighborhood attention on {prefix} set.')
+        _log.info(f'Starting evaluation > with < neighborhood attention on {prefix} set.')
 
     compute_filtered = filtering_graph is not None
     _log.info(f'Computing the filtered setting: {compute_filtered}.')
@@ -185,50 +197,30 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
     else:
         max_ent_id = entities.max()
 
-    # todo remove after debugging
-    if os.path.exists(osp.join('./output', f'{prefix}_ent_emb.pt')):
-        _log.info('Loading embeddings from file.')
-        ent_emb = torch.load(osp.join('./output', f'{prefix}_ent_emb.pt'))
-        ent2idx = torch.load(osp.join('./output', f'{prefix}_ent2idx.pt'))
-    else:
-        _log.info('Computing embeddings.')
-        ent2idx = torch.full([max_ent_id + 1], fill_value=-1, dtype=torch.long)
+    _log.info('Computing embeddings.')
+    ent2idx = torch.full([max_ent_id + 1], fill_value=-1, dtype=torch.long)
+    ent_emb = torch.full((num_entities, emb_dim), fill_value=-1, dtype=torch.float)
+
+    for ent_idx, ent_id in enumerate(tqdm(entities.tolist())):
+        ent2idx[ent_id] = ent_idx
 
         if neighborhood_selector is None:
-            ent_emb = torch.full((num_entities, emb_dim), fill_value=-1, dtype=torch.float)
+            text_tok, text_mask, _ = text_dataset.get_entity_description(torch.tensor([ent_id]))
+            text_tok_neighbors = None
         else:
-            ent_emb = torch.full((num_entities, num_relations, emb_dim), fill_value=-1, dtype=torch.float)
-            rels = torch.arange(num_relations)
+            text_tok, text_mask, _ = text_dataset.get_entity_description(torch.tensor([ent_id]))
 
-        for ent_idx, ent_id in enumerate(tqdm(entities.tolist())):
-            ent2idx[ent_id] = ent_idx
+            neighbors = neighborhood_selector(torch.tensor([ent_id]), rels=None,
+                                              neigh_selection=neigh_selection)
+            text_tok_neighbors, text_mask_neighbors, _ = text_dataset.get_entity_description(neighbors)
+            text_tok_neighbors = text_tok_neighbors.to(device)
 
-            # todo remove after debugging
-            if ent_id not in new_entities:
-                continue
+        text_len = text_tok.size(1)
+        batch_emb_id = model(text_tok=text_tok.reshape((-1, text_len)).to(device),
+                             text_mask=text_mask.reshape((-1, text_len)).to(device),
+                             text_tok_neighborhood_all=text_tok_neighbors)
 
-            if neighborhood_selector is None:
-                text_tok, text_mask, _ = text_dataset.get_entity_description(torch.tensor([ent_id]))
-                text_tok_neighbors = None
-            else:
-                batch_ents = torch.full([num_relations], fill_value=ent_id)
-                text_tok, text_mask, _ = text_dataset.get_entity_description(batch_ents)
-                neighbors = neighborhood_selector(batch_ents, rels=rels, neigh_selection='attention')
-                text_tok_neighbors, text_mask_neighbors, _ = text_dataset.get_entity_description(neighbors)
-
-            text_len = text_tok.size(1)
-            batch_emb_id = model(text_tok=text_tok.reshape((-1, text_len)).to(device),
-                                 text_mask=text_mask.reshape((-1, text_len)).to(device),
-                                 text_tok_neighborhood_all=text_tok_neighbors.to(device))
-
-
-            ent_emb[ent_idx] = batch_emb_id
-
-        _log.info('Saving embeddings.')
-        torch.save(ent_emb, osp.join('./output', f'{prefix}_ent_emb.pt'))
-        torch.save(ent2idx, osp.join('./output', f'{prefix}_ent2idx.pt'))
-
-
+        ent_emb[ent_idx] = batch_emb_id
 
     num_predictions = 0
     _log.info('Computing metrics on set of triples')
@@ -253,22 +245,10 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
 
         # Embed triples
         # shape: batch size x emb_dim
-        if neighborhood_selector is None:
-            head_embs = ent_emb[heads]
-            tail_embs = ent_emb[tails]
-        else:
-            head_embs = ent_emb[heads, rels.flatten()]
-            tail_embs = ent_emb[tails, rels.flatten()]
+        head_embs = ent_emb[heads]
+        tail_embs = ent_emb[tails]
 
-        # Score all possible heads and tails
-        ent_emb_new = []
-        if neighborhood_selector is None:
-            ent_emb_new = ent_emb.repeat((tail_embs.size(0), 1, 1)).to(device)
-        else:
-            for r in rels.flatten():
-                ent_emb_new.append(ent_emb[:, r])
-            # batch size x num entities x embedding dim
-            ent_emb_new = torch.stack(ent_emb_new).to(device)
+        ent_emb_new = ent_emb.repeat((tail_embs.size(0), 1, 1)).to(device)
 
         tail_embs = tail_embs.unsqueeze(1).repeat((1, ent_emb_new.size(1), 1)).to(device)
         head_embs = head_embs.unsqueeze(1).repeat((1, ent_emb_new.size(1), 1)).to(device)
@@ -398,281 +378,13 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
     return scores
 
 
-@ex.capture
-@torch.no_grad()
-def eval_link_prediction(model, triples_loader, text_dataset, entities,
-                         epoch, emb_batch_size, _run: Run, _log: Logger,
-                         prefix='', max_num_batches=None,
-                         filtering_graph=None, new_entities=None,
-                         return_embeddings=False, neighborhood_enrichment=False, fusion_method=None):
-    scores = {}
-    compute_filtered = filtering_graph is not None
-    mrr_by_position = torch.zeros(3, dtype=torch.float).to(device)
-    mrr_pos_counts = torch.zeros_like(mrr_by_position)
-
-    rel_categories = triples_loader.dataset.rel_categories.to(device)
-    mrr_by_category = torch.zeros([2, 4], dtype=torch.float).to(device)
-    mrr_cat_count = torch.zeros([1, 4], dtype=torch.float).to(device)
-
-    hit_positions = [1, 3, 10]
-    k_values = torch.tensor([hit_positions], device=device)
-    hits_at_k = {pos: 0.0 for pos in hit_positions}
-    mrr = 0.0
-    mrr_filt = 0.0
-    hits_at_k_filt = {pos: 0.0 for pos in hit_positions}
-
-    if device != torch.device('cpu'):
-        model = model.module
-
-    if isinstance(model, models.InductiveLinkPrediction):
-        num_entities = entities.shape[0]
-        if compute_filtered:
-            max_ent_id = max(filtering_graph.nodes)
-        else:
-            max_ent_id = entities.max()
-        ent2idx = utils.make_ent2idx(entities, max_ent_id)
-    else:
-        # Transductive models have a lookup table of embeddings
-        num_entities = model.ent_emb.num_embeddings
-        ent2idx = torch.arange(num_entities)
-        entities = ent2idx
-
-    # Create embedding lookup table for evaluation
-    ent_emb = torch.zeros((num_entities, model.dim), dtype=torch.float,
-                          device=device)
-    idx = 0
-    num_iters = np.ceil(num_entities / emb_batch_size)
-    iters_count = 0
-    while idx < num_entities:
-        # Get a batch of entity IDs and encode them
-        batch_ents = entities[idx:idx + emb_batch_size]
-
-        # add padding to even size for allowing reshaping and splitting of the neighbors
-        padding = batch_ents.size(0) % 2 == 1
-
-        if padding:
-            batch_ents = torch.cat((batch_ents, batch_ents[-1].unsqueeze(0)))
-
-        if isinstance(model, models.InductiveLinkPrediction):
-            # Encode with entity descriptions
-
-            text_tok, text_mask, text_len = text_dataset.get_entity_description(batch_ents)
-
-            if neighborhood_enrichment:
-                neighbors = text_dataset.get_neighbors(batch_ents).view(-1, 2)
-
-                # neighbors are split into two columns, one for head and one for tail in order to use the
-                # existing forward function
-                text_tok_neighbors_head, text_mask_neighbors_head, _ = text_dataset.get_entity_description(
-                    neighbors[:, 0])
-                text_tok_neighbors_tail, text_mask_neighbors_tail, _ = text_dataset.get_entity_description(
-                    neighbors[:, 1])
-
-                batch_emb = model(text_tok=text_tok.reshape((-1, 2, text_dataset.max_len)).to(device),
-                                  text_mask=text_mask.reshape((-1, 2, 32)).to(device),
-                                  text_tok_neighborhood_head=text_tok_neighbors_head.reshape(
-                                      (-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device),
-                                  text_mask_neighborhood_head=text_mask_neighbors_head.reshape(
-                                      (-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device),
-                                  text_tok_neighborhood_tail=text_tok_neighbors_tail.reshape(
-                                      (-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device),
-                                  text_mask_neighborhood_tail=text_mask_neighbors_tail.reshape(
-                                      (-1, text_dataset.num_neighbors, text_dataset.max_len)).to(device))
-
-            else:
-                batch_emb = model(text_tok=text_tok.unsqueeze(1).to(device),
-                                  text_mask=text_mask.unsqueeze(1).to(device))
-
-            # remove embedded padding
-            if padding:
-                batch_emb = batch_emb[:-1]
-
-            # print('----')
-
-        else:
-            # Encode from lookup table
-            batch_emb = model(batch_ents)
-
-        ent_emb[idx:idx + batch_ents.shape[0]] = batch_emb
-
-        iters_count += 1
-        if iters_count % np.ceil(0.2 * num_iters) == 0:
-            _log.info(f'[{idx + batch_ents.shape[0]:,}/{num_entities:,}]')
-
-        idx += emb_batch_size
-
-    ent_emb = ent_emb.unsqueeze(0)
-
-    num_predictions = 0
-    _log.info('Computing metrics on set of triples')
-    total = len(triples_loader) if max_num_batches is None else max_num_batches
-
-    triple_ranks_all = []
-    triple_ranks_filtered_all = []
-    for i, triples in enumerate(triples_loader):
-
-        if max_num_batches is not None and i == max_num_batches:
-            break
-
-        heads, tails, rels = torch.chunk(triples, chunks=3, dim=1)
-        t = torch.cat((heads, rels, tails), dim=1)
-
-        # Map entity IDs to positions in ent_emb
-        heads = ent2idx[heads].to(device)
-        tails = ent2idx[tails].to(device)
-
-        assert heads.min() >= 0
-        assert tails.min() >= 0
-
-        # Embed triple
-        head_embs = ent_emb.squeeze()[heads]
-        tail_embs = ent_emb.squeeze()[tails]
-        rel_embs = model.rel_emb(rels.to(device))
-
-        # Score all possible heads and tails
-        ent_emb_new = ent_emb.repeat((tail_embs.size(0), 1, 1))
-        tail_embs = tail_embs.repeat((1, ent_emb.size(1), 1))
-        head_embs = head_embs.repeat((1, ent_emb.size(1), 1))
-        rel_embs = rel_embs.repeat((1, ent_emb.size(1), 1))
-
-        heads_predictions = model.score_fn(ent_emb_new, tail_embs, rel_embs, eval=True)
-        tails_predictions = model.score_fn(head_embs, ent_emb_new, rel_embs, eval=True)
-
-        pred_ents = torch.cat((heads_predictions, tails_predictions))
-        true_ents = torch.cat((heads, tails))
-
-        num_predictions += pred_ents.shape[0]
-        reciprocals, hits, ranks = utils.get_metrics(pred_ents, true_ents, k_values)
-        ranks = torch.reshape(ranks, (2, -1))
-
-        triple_ranks = torch.cat((t, ranks[0].unsqueeze(1).cpu(), ranks[1].unsqueeze(1).cpu()),
-                                 dim=1).type(torch.int32)
-        triple_ranks_all.append(triple_ranks)
-
-        mrr += reciprocals.sum().item()
-        hits_sum = hits.sum(dim=0)
-        for j, k in enumerate(hit_positions):
-            hits_at_k[k] += hits_sum[j].item()
-
-        if compute_filtered:
-            filters = utils.get_triple_filters(triples, filtering_graph,
-                                               num_entities, ent2idx)
-            heads_filter, tails_filter = filters
-            # Filter entities by assigning them the lowest score in the batch
-            filter_mask = torch.cat((heads_filter, tails_filter)).to(device)
-            pred_ents[filter_mask] = pred_ents.min() - 1.0
-
-            reciprocals, hits, ranks = utils.get_metrics(pred_ents, true_ents, k_values)
-            ranks = torch.reshape(ranks, (2, -1))  # split head and tail ranks
-
-            # typecase just to be sure
-            triple_ranks_filtered = torch.cat(
-                (t, ranks[0].unsqueeze(1).cpu(), ranks[1].unsqueeze(1).cpu()), dim=1).type(torch.int32)
-            triple_ranks_filtered_all.append(triple_ranks_filtered)
-
-            mrr_filt += reciprocals.sum().item()
-            hits_sum = hits.sum(dim=0)
-            for j, k in enumerate(hit_positions):
-                hits_at_k_filt[k] += hits_sum[j].item()
-
-            reciprocals = reciprocals.squeeze()
-            if new_entities is not None:
-                by_position = utils.split_by_new_position(triples,
-                                                          reciprocals,
-                                                          new_entities)
-                batch_mrr_by_position, batch_mrr_pos_counts = by_position
-                mrr_by_position += batch_mrr_by_position
-                mrr_pos_counts += batch_mrr_pos_counts
-
-            if triples_loader.dataset.has_rel_categories:
-                by_category = utils.split_by_category(triples,
-                                                      reciprocals,
-                                                      rel_categories)
-                batch_mrr_by_cat, batch_mrr_cat_count = by_category
-                mrr_by_category += batch_mrr_by_cat
-                mrr_cat_count += batch_mrr_cat_count
-
-        if (i + 1) % int(0.2 * total) == 0:
-            _log.info(f'[{i + 1:,}/{total:,}]')
-
-    _log.info(f'The total number of predictions is {num_predictions:,}')
-    for hits_dict in (hits_at_k, hits_at_k_filt):
-        for k in hits_dict:
-            hits_dict[k] /= num_predictions
-
-    mrr = mrr / num_predictions
-    mrr_filt = mrr_filt / num_predictions
-
-    triple_ranks_all = torch.cat(triple_ranks_all, dim=0)
-
-    scores['mr'] = triple_ranks_all[:, 3:].float().mean().item()
-
-    log_str = f'{prefix} mrr: {mrr:.4f}  '
-    _run.log_scalar(f'{prefix}_mrr', mrr, epoch)
-    for k, value in hits_at_k.items():
-        scores[f'hits@{k}'] = value
-        log_str += f'hits@{k}: {value:.4f}  '
-        _run.log_scalar(f'{prefix}_hits@{k}', value, epoch)
-
-    scores['mrr'] = mrr
-    if compute_filtered:
-        triple_ranks_filtered_all = torch.cat(triple_ranks_filtered_all, dim=0)
-        log_str += f'mrr_filt: {mrr_filt:.4f}  '
-        scores['mrr_filt'] = mrr_filt
-        scores['mr_filt'] = triple_ranks_filtered_all[:, 3:].float().mean().item()
-        print('mr_filt:', scores['mr_filt'])
-        _run.log_scalar(f'{prefix}_mrr_filt', mrr_filt, epoch)
-        for k, value in hits_at_k_filt.items():
-            scores[f'hits@{k}_filt'] = value
-            log_str += f'hits@{k}_filt: {value:.4f}  '
-            _run.log_scalar(f'{prefix}_hits@{k}_filt', value, epoch)
-
-    _log.info(log_str)
-
-    if new_entities is not None and compute_filtered:
-        mrr_pos_counts[mrr_pos_counts < 1.0] = 1.0
-        mrr_by_position = mrr_by_position / mrr_pos_counts
-        log_str = ''
-        for i, t in enumerate((f'{prefix}_mrr_filt_both_new',
-                               f'{prefix}_mrr_filt_head_new',
-                               f'{prefix}_mrr_filt_tail_new')):
-            value = mrr_by_position[i].item()
-            log_str += f'{t}: {value:.4f}  '
-            _run.log_scalar(t, value, epoch)
-        _log.info(log_str)
-
-    if compute_filtered and triples_loader.dataset.has_rel_categories:
-        mrr_cat_count[mrr_cat_count < 1.0] = 1.0
-        mrr_by_category = mrr_by_category / mrr_cat_count
-
-        for i, case in enumerate(['pred_head', 'pred_tail']):
-            log_str = f'{case} '
-            for cat, cat_id in CATEGORY_IDS.items():
-                log_str += f'{cat}_mrr: {mrr_by_category[i, cat_id]:.4f}  '
-            _log.info(log_str)
-
-    if return_embeddings:
-        out = (scores, ent_emb)
-    else:
-        out = (scores, None)
-
-    print(scores)
-
-    if prefix == 'test':
-        ranks_file_name = f'triple_ranks_all-{datetime.now().strftime("%Y-%m-%d-%H-%M")}.pt'
-        print('saving triple ranks:', ranks_file_name)
-        torch.save(triple_ranks_filtered_all, osp.join(OUT_PATH, ranks_file_name))
-
-    return out
-
-
 @ex.command
 def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                     encoder_name, regularizer, max_len, num_negatives, lr,
                     use_scheduler, batch_size, emb_batch_size, eval_batch_size,
                     max_epochs, checkpoint, checkpoint_neigh, use_cached_text, use_cached_neighbors,
-                    neighborhood_enrichment, num_neighbors, edge_features, fusion_method,
-                    weighted_pooling, neighborhood_selection, permute_neighbors, wandb_logging,
+                    neighborhood_enrichment, num_neighbors, edge_features,
+                    weighted_pooling, neigh_ordering, neigh_selection, wandb_logging,
                     _run: Run, _log: Logger):
     _log.info(f'config: {_run.config}')
 
@@ -723,14 +435,14 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                                       tokenizer,
                                                       drop_stopwords,
                                                       num_neighbors=num_neighbors,
-                                                      selection=neighborhood_selection,
+                                                      neigh_ordering=neigh_ordering,
+                                                      neigh_selection=neigh_selection,
                                                       write_maps_file=True,
                                                       use_cached_text=use_cached_text,
                                                       use_cached_neighbors=use_cached_neighbors,
                                                       num_devices=num_devices,
                                                       device=device,
-                                                      tokenizer_name=tokenizer_name,
-                                                      permute_neighbors=permute_neighbors)
+                                                      tokenizer_name=tokenizer_name)
         else:
             train_data = TextGraphDataset(triples_file,
                                           num_negatives,
@@ -786,31 +498,33 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
 
     model = utils.get_model(model, dim, rel_model, loss_fn,
                             len(train_val_test_ent), train_data.num_rels,
-                            encoder_name, regularizer, num_neighbors, fusion_method, edge_features,
+                            encoder_name, regularizer, num_neighbors, edge_features,
                             weighted_pooling)
 
-    if neighborhood_enrichment:
+    if neighborhood_enrichment and neigh_selection == ATTENTION:
         model_neigh_sel = NeighborhoodSelectionTransformer(encoder_name=encoder_name)
+    else:
+        model_neigh_sel = None
 
     if checkpoint is not None:
         _log.info(f'Loading model from checkpoint: {checkpoint}, {checkpoint_neigh}')
         model.load_state_dict(torch.load(checkpoint, map_location='cpu'))
-        if neighborhood_enrichment:
+        if model_neigh_sel is not None:
             model_neigh_sel.load_state_dict(torch.load(checkpoint_neigh, map_location='cpu'))
         _log.info('Models loaded')
 
     if device != torch.device('cpu'):
         model = torch.nn.DataParallel(model).to(device)
-        if neighborhood_enrichment:
+        if model_neigh_sel is not None:
             model_neigh_sel = torch.nn.DataParallel(model_neigh_sel).to(device)
 
     # provide the data loader with the model for the neighborhood attention
-    if neighborhood_enrichment:
+    if model_neigh_sel is not None:
         train_data.neighborhood_attention_model = model_neigh_sel
 
     if checkpoint is None:
         _log.info('Start model training')
-        if neighborhood_enrichment:
+        if model_neigh_sel is not None:
             optimizer = Adam(list(model.parameters()) + list(model_neigh_sel.parameters()), lr=lr)
         else:
             optimizer = Adam(model.parameters(), lr=lr)
@@ -825,46 +539,10 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
         checkpoint_file = osp.join(OUT_PATH,
                                    f'model-{encoder_name}-{datetime.now().strftime("%Y-%m-%d-%H-%M")}-{"".join([random.choice(string.ascii_lowercase) for _ in range(6)])}')
         _log.info(f'checkpoint_file: {checkpoint_file} + .pt/_neigh_sel.pt')
-        # todo add time per batch estimation to logging
+
         epoch_start_time = time.time()
         for epoch in range(1, max_epochs + 1):
             train_loss = 0
-
-            # todo uncomment for evaluation during training
-            # --- start: added for debugging
-            # _log.info('Evaluating on validation set')
-
-            # new for neighborhood attention
-            # eval_link_prediction_neigh_attention(model, valid_loader, train_data,
-            #                                     train_val_ent, epoch,
-            #                                     emb_batch_size, prefix='valid',
-            #                                  neighborhood_enrichment=True,
-            #                                  neighborhood_selector=train_data.get_neighbors,
-            #                                    emb_dim=dim)
-
-            # val_scores, _ = eval_link_prediction(model, valid_loader, train_data,
-            #                                  train_val_ent, epoch,
-            #                                  emb_batch_size, prefix='valid',
-            #                                  neighborhood_enrichment=neighborhood_enrichment,
-            #                                  fusion_method=fusion_method)
-
-            # _log.info('Evaluating on test set')
-            # val_scores, ent_emb = eval_link_prediction(model, test_loader, train_data,
-            #                                  train_val_test_ent, max_epochs + 1,
-            #                                  emb_batch_size, prefix='test',
-            #                                  filtering_graph=graph,
-            #                                  new_entities=test_new_ents,
-            #                                  return_embeddings=True,
-            #                                  neighborhood_enrichment=neighborhood_enrichment)
-
-            # print('logging to wandb')
-            # log_data = {"loss": train_loss / len(train_loader)}
-            # for k in ['mrr', 'hits@1', 'hits@3', 'hits@10', 'mr']:
-            #    if k in val_scores:
-            #        log_data[k] = val_scores[k]
-            # wandb.log(log_data, step=epoch)
-            # print('log_data', log_data)
-            # --- end: added for debugging
 
             for step, data in enumerate(train_loader):
                 batch_start_time = time.time()
@@ -885,71 +563,57 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                               f'[{step}/{len(train_loader)}]: {loss.item():.6f}')
                     _run.log_scalar('batch_loss', loss.item())
 
-                #_log.info(f'Time per batch: {time.time() - batch_start_time}')
+                # _log.info(f'Time per batch: {time.time() - batch_start_time}')
 
             _run.log_scalar('train_loss', train_loss / len(train_loader), epoch)
             _log.info(f'Time per epoch: {time.time() - epoch_start_time}')
 
-            eval_loss_ = eval_link_prediction_neigh_attention_loss(model, valid_loader, train_data,
-                                                                   _log=_log, num_negative=num_negatives,
-                                                                   prefix='valid')
-            test_loss_ = eval_link_prediction_neigh_attention_loss(model, test_loader, train_data,
-                                                                   _log=_log, num_negative=num_negatives,
-                                                                   prefix='test')
+            val_scores = eval_link_prediction_neigh_attention(model,
+                                                              test_loader,
+                                                              train_data,
+                                                              train_val_test_ent,
+                                                              prefix='test',
+                                                              filtering_graph=graph,
+                                                              new_entities=test_new_ents,
+                                                              neighborhood_selector=train_data.get_neighbors if neighborhood_enrichment else None,
+                                                              emb_dim=dim,
+                                                              neigh_selection=neigh_selection)
 
-            # todo currently no evaluation during training. Reactivate if evaluation time is reasonable.
-            evaluate = False
-            if evaluate:
-                if dataset != 'Wikidata5M':
-                    _log.info('Evaluating on sample of training set')
-                    eval_link_prediction(model, train_eval_loader, train_data, train_ent,
-                                         epoch, emb_batch_size, prefix='train',
-                                         max_num_batches=len(valid_loader),
-                                         neighborhood_enrichment=neighborhood_enrichment,
-                                         fusion_method=fusion_method)
 
-                _log.info('Evaluating on validation set')
-                val_scores, _ = eval_link_prediction(model, valid_loader, train_data,
-                                                     train_val_ent, epoch,
-                                                     emb_batch_size, prefix='valid',
-                                                     neighborhood_enrichment=neighborhood_enrichment,
-                                                     fusion_method=fusion_method)
-
-                # Keep checkpoint of best performing model (based on raw MRR)
-                if val_scores['mrr'] > best_valid_mrr:
-                    best_valid_mrr = val_scores['mrr']
-                    torch.save(model.module.state_dict(), checkpoint_file + '.pt')
-                    torch.save(model_neigh_sel.module.state_dict(), checkpoint_file + '_neigh_sel.pt')
-            else:
-                print(f'saving models to {checkpoint_file}.pt & {checkpoint_file}_neigh_sel.pt')
+            # Keep checkpoint of best performing model (based on raw MRR)
+            if val_scores['mrr_filt'] > best_valid_mrr:
+                best_valid_mrr = val_scores['mrr_filt']
                 torch.save(model.module.state_dict(), checkpoint_file + '.pt')
-                if neighborhood_enrichment:
+                if model_neigh_sel is not None:
                     torch.save(model_neigh_sel.module.state_dict(), checkpoint_file + '_neigh_sel.pt')
 
+                if wandb_logging:
+                    log_data = val_scores
 
-            if wandb_logging:
-                avg_loss = train_loss / len(train_loader)
-                print(f'logging avg. train loss to wandb: {avg_loss}')
-                log_data = {"loss": avg_loss, "eval_loss": eval_loss_, "test_loss": test_loss_}
-                # todo also reactivate if evaluation time is reasonable
-                if evaluate:
-                    for k in ['mrr', 'hits@1', 'hits@3', 'hits@10', 'mr']:
-                        if k in val_scores:
-                            log_data[f'val_{k}'] = val_scores[k]
-                wandb.log(log_data, step=epoch)
+                    avg_loss = train_loss / len(train_loader)
+                    avg_eval_loss_ = eval_link_prediction_neigh_attention_avg_loss(model, valid_loader, train_data,
+                                                                                   _log=_log, num_negative=num_negatives,
+                                                                                   prefix='valid', neighborhood_enrichment=neighborhood_enrichment, neigh_selection=neigh_selection)
+                    avg_test_loss_ = eval_link_prediction_neigh_attention_avg_loss(model, test_loader, train_data,
+                                                                                   _log=_log, num_negative=num_negatives,
+                                                                                   prefix='test', neighborhood_enrichment=neighborhood_enrichment, neigh_selection=neigh_selection)
+
+                    log_data["loss"] = avg_loss
+                    log_data["eval_loss"] = avg_eval_loss_
+                    log_data["test_loss"] = avg_test_loss_
+                    wandb.log(log_data, step=epoch)
 
         # Evaluate with best performing checkpoint
         if max_epochs > 0:
             _log.info(f'--> Loading best model from checkpoint: {checkpoint_file}')
             model.module.load_state_dict(torch.load(checkpoint_file + '.pt'))
-            if neighborhood_enrichment:
+            if model_neigh_sel is not None:
                 model_neigh_sel.module.load_state_dict(torch.load(checkpoint_file + '_neigh_sel.pt'))
 
     if dataset == 'Wikidata5M':
         graph = nx.MultiDiGraph()
         graph.add_weighted_edges_from(valid_data.triples.tolist())
 
-    """
     _log.info('Evaluating on validation set')
     eval_start_time = time.time()
     eval_link_prediction_neigh_attention(model,
@@ -960,9 +624,9 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                          filtering_graph=graph,
                                          new_entities=val_new_ents,
                                          neighborhood_selector=train_data.get_neighbors if neighborhood_enrichment else None,
-                                         emb_dim=dim)
+                                         emb_dim=dim, 
+                                         neigh_selection=neigh_selection)
     _log.info(f'Evaluation time: {time.time() - eval_start_time}')
-    """
 
     if dataset == 'Wikidata5M':
         graph = nx.MultiDiGraph()
@@ -978,7 +642,8 @@ def link_prediction(dataset, inductive, dim, model, rel_model, loss_fn,
                                          filtering_graph=graph,
                                          new_entities=test_new_ents,
                                          neighborhood_selector=train_data.get_neighbors if neighborhood_enrichment else None,
-                                         emb_dim=dim)
+                                         emb_dim=dim,
+                                         neigh_selection=neigh_selection)
     _log.info(f'Evaluation time: {time.time() - eval_start_time}')
 
 

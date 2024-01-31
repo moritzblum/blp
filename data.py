@@ -22,12 +22,14 @@ nltk.download('punkt')
 STOP_WORDS = stopwords.words('english')
 DROPPED = STOP_WORDS + list(string.punctuation)
 CATEGORY_IDS = {'1-to-1': 0, '1-to-many': 1, 'many-to-1': 2, 'many-to-many': 3}
+SEP_TOKEN_ID = 102
 
 DEGREE_TRAIN = 'degree_train'
 RANDOM = 'random'
 TFIDF_RELEVANCE = 'tfidf_relevance'
 SEMANTIC_RELEVANCE = 'semantic_relevance'
 SEMANTIC_RELEVANCE_REDUNDANCY = 'semantic_relevance_redundancy'
+ATTENTION = 'attention'
 
 
 def file_to_ids(file_path):
@@ -339,9 +341,9 @@ class TextGraphDataset(GraphDataset):
 
 class NeighborhoodTextGraphDataset(TextGraphDataset):
     def __init__(self, triples_file, neg_samples, max_len, tokenizer,
-                 drop_stopwords, num_neighbors=5, selection=RANDOM, write_maps_file=False,
+                 drop_stopwords, num_neighbors=5, neigh_ordering=RANDOM, neigh_selection=ATTENTION, write_maps_file=False,
                  use_cached_text=False, use_cached_neighbors=False,
-                 num_devices=1, device=None, tokenizer_name='bert-base-uncased', dataset_name='wikidata5m', permute_neighbors=True):
+                 num_devices=1, device=None, tokenizer_name='bert-base-uncased', dataset_name='wikidata5m'):
 
         super().__init__(triples_file, neg_samples, max_len, tokenizer,
                          drop_stopwords, write_maps_file, use_cached_text,
@@ -349,8 +351,8 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
 
         self.device = device
         self.num_neighbors = num_neighbors
-        self.selection = selection
-        self.permute_neighbors = permute_neighbors
+        self.neigh_ordering = neigh_ordering
+        self.neigh_selection = neigh_selection
 
         self.maps = torch.load(self.maps_path)
         blp_ent_ids = self.maps['ent_ids']  # mapping: entity URI -> ID
@@ -376,8 +378,6 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
 
         print('Text data shape:', self.text_data.size())
         print('Relation descriptions shape:', self.text_data_rel.size())
-
-
 
 
         # as this class is just used for the training set, this list only contains train entity
@@ -418,7 +418,7 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
             degree_dict = Counter(self.triples[:, 0].tolist() + self.triples[:, 1].tolist())
 
             for ent_id, neigh_ids in tqdm(neighbor_dict.items()):
-                if self.selection == DEGREE_TRAIN:
+                if self.neigh_ordering == DEGREE_TRAIN:
                     neighbors_list_ordered = torch.tensor(sorted(neigh_ids.tolist(),
                                                     key=lambda e: - degree_dict[e]))
                 else:
@@ -433,10 +433,9 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
             neighbor_tensor = torch.load(osp.join(self.directory, 'neighbors_tmp.pt'))
 
 
-        #self.neighbors = neighbor_tensor[:, :self.num_neighbors]
         self.neighbors = neighbor_tensor
 
-    def get_neighbors(self, ent_ids, neigh_selection='random', rels=None, neighbor_focus=20, permute_neighbors=False) -> torch.Tensor:
+    def get_neighbors(self, ent_ids, neigh_selection='random', rels=None, neighbor_focus=20) -> torch.Tensor:
         """
         Computes the neighborhood of the given entities.
         @param ent_ids: list or 1D Tensor of entity ids that need a neighborhood
@@ -449,50 +448,39 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
                 selection
         @return: neighborhood of the given entities as a tensor of entity ids
         """
-        SEP_TOKEN_ID = 102
 
-        if neigh_selection == 'random':
+        if neigh_selection == RANDOM:
             return self.neighbors[ent_ids][:, torch.randperm(neighbor_focus)[:self.num_neighbors]]
         elif neigh_selection == 'no':
             return self.neighbors[:, :self.num_neighbors][ent_ids]
-        elif neigh_selection == 'attention':
+        elif neigh_selection == ATTENTION:
             # neighbors are selected based on the learned relevance
 
-
-            if rels is None:
-                text_token_rel = torch.tensor([])
-            else:
-
+            if rels is not None:
                 # get relation descriptions: (batch_size, text_len)
-                text_token_rel = self.text_data_rel[rels]
-                # repeat relation descriptions for each candidate neighbor:
-                # (batch_size, text_len * num_neighbors) and transform to (batch_size * num_neighbors, text_len)
-                text_token_rel = text_token_rel.repeat(1, neighbor_focus).reshape(-1, text_token_rel.size(-1))
-
-                # get entity descriptions: (batch_size * num_neighbors, text_len)
-
-            # permute neighbors before selection to make the neighborhood selection model more robust
-            if permute_neighbors:
-                neigh_focus_subset_new = torch.full_like(self.neighbors[ent_ids, :neighbor_focus], -1)
-                for idx, neigh_row in enumerate(self.neighbors[ent_ids]):
-                    n = neigh_row[:neighbor_focus][torch.randperm(neighbor_focus)]
-                    neigh_focus_subset_new[idx, :(neigh_row != -1).sum()] = n[(n != -1)]
-
+                text_token_sel = self.text_data_rel[rels]
             else:
-                neigh_focus_subset_new = self.neighbors[ent_ids, :neighbor_focus]
+                # get head/tail descriptions: (batch_size, text_len)
+                text_token_sel, _, _ = self.get_entity_description(ent_ids)
 
-            text_tok_ent, text_mask_ent, text_len_ent = self.get_entity_description(neigh_focus_subset_new.flatten())
+            # repeat relation descriptions for each candidate neighbor:
+            # (batch_size, text_len * num_neighbors) and transform to (batch_size * num_neighbors, text_len)
+            text_token_sel = text_token_sel.repeat(1, neighbor_focus).reshape(-1, text_token_sel.size(-1))
 
-            # concatenate relation and entity descriptions: (batch_size * num_neighbors, text_len * 2)
-            rel_neigh_tok = torch.cat([text_token_rel,
-                                       torch.full((text_token_rel.size(0), 1), SEP_TOKEN_ID),
-                                       text_tok_ent], dim=1)
+            neigh_focus_subset_new = self.neighbors[ent_ids, :neighbor_focus]
 
-            rel_neigh_tok_mask = (rel_neigh_tok > 0).float()
+            text_tok_neigh, text_mask_neigh, text_len_neigh = self.get_entity_description(neigh_focus_subset_new.flatten())
+
+            # concatenate selection description and neighboring entity descriptions: (batch_size * num_neighbors, text_len * 2)
+            sel_neigh_tok = torch.cat([text_token_sel,
+                                       torch.full((text_token_sel.size(0), 1), SEP_TOKEN_ID),
+                                       text_tok_neigh], dim=1)
+
+            sel_neigh_tok_mask = (sel_neigh_tok > 0).float()
 
             # call the attention model
-            x = self.neighborhood_attention_model(rel_neigh_tok.to(self.device), rel_neigh_tok_mask.to(self.device))
-            x = x.reshape(rels.size(0), neighbor_focus)  # neighbor_focus was -1 before
+            x = self.neighborhood_attention_model(sel_neigh_tok.to(self.device), sel_neigh_tok_mask.to(self.device))
+            x = x.reshape(-1, neighbor_focus)  # neighbor_focus was -1 before
 
             # sort neighbors according to their attention weights
             indices_ = torch.argsort(x, descending=True, dim=1)
@@ -528,9 +516,8 @@ class NeighborhoodTextGraphDataset(TextGraphDataset):
         # transpose and flatten it
         # changed: rel reshaping
         neighbors = self.get_neighbors(pos_pairs.flatten(),
-                                       rels= rels.repeat(1, 2).flatten(),
-                                       neigh_selection='attention',
-                                       permute_neighbors=self.permute_neighbors)
+                                       rels= None, # todo rel aware attention: rels.repeat(1, 2).flatten(),
+                                       neigh_selection=self.neigh_selection)
 
         text_tok_neighborhood_all, _, _ = self.get_entity_description(neighbors)
 
