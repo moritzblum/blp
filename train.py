@@ -101,7 +101,7 @@ def eval_link_prediction_neigh_attention_avg_loss(model, triples_loader, text_da
     eval_loss_all = 0
     _log.info(f'Evaluating Loss on {prefix} set.')
 
-    for i, triples in enumerate(tqdm(triples_loader)):
+    for i, triples in enumerate(triples_loader):
         heads, tails, rels = torch.chunk(triples, chunks=3, dim=1)
 
         heads = heads.flatten()
@@ -201,7 +201,7 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
     ent2idx = torch.full([max_ent_id + 1], fill_value=-1, dtype=torch.long)
     ent_emb = torch.full((num_entities, emb_dim), fill_value=-1, dtype=torch.float)
 
-    for ent_idx, ent_id in enumerate(tqdm(entities.tolist())):
+    for ent_idx, ent_id in enumerate(entities.tolist()):
         ent2idx[ent_id] = ent_idx
 
         if neighborhood_selector is None:
@@ -333,6 +333,8 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
     scores['mr'] = mr
 
     log_str = f'{prefix} mrr: {mrr:.4f}  '
+    log_str += f'{prefix} mr: {mr:.4f}  '
+
     for k, value in hits_at_k.items():
         scores[f'hits@{k}'] = value
         log_str += f'hits@{k}: {value:.4f}  '
@@ -346,6 +348,7 @@ def eval_link_prediction_neigh_attention(model, triples_loader, text_dataset, en
         scores['mr_filt'] = mr_filt
 
         log_str += f'mrr_filt: {mrr_filt:.4f}  '
+        log_str += f'mr_filt: {mr_filt:.4f}  '
 
         for k, value in hits_at_k_filt.items():
             scores[f'hits@{k}_filt'] = value
